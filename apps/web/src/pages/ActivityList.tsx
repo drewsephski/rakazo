@@ -3,13 +3,13 @@ import { t } from "@lingui/core/macro";
 import { Trans, useLingui } from "@lingui/react/macro";
 import type { RunActivityRow, RunStatus } from "@rakazo/contracts";
 import { Button, Input, Label } from "@rakazo/ui-web";
-import { useEffect, useId, useMemo, useState, type KeyboardEvent } from "react";
+import { type KeyboardEvent, useEffect, useId, useMemo, useState } from "react";
 import {
+  type ActivityListFilters,
   activityFiltersActive,
   clearActivityFilterField,
   emptyActivityFilters,
   filterActivityRuns,
-  type ActivityListFilters,
 } from "../lib/activity-list-filters";
 import { rpc } from "../lib/rpc";
 
