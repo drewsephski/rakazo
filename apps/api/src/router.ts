@@ -111,6 +111,7 @@ import {
   CannotDeleteLastSpaceError,
   CannotDeleteSpaceAsNonOwnerError,
   ComputerLimitError,
+  chooseModelCredential,
   claimEmptySpaceDeletionForMember,
   createExternalConversationRepos,
   createGroupRepos,
@@ -1004,10 +1005,27 @@ export function createRouter(deps: RouterDeps) {
         await withSerializableRetry(() =>
           deps.prisma.$transaction(
             async (tx) => {
-              const credential = await tx.userModelCredential.findFirst({
-                where: { userId: context.actor.userId, provider: input.provider },
-                orderBy: newestModelCredentialOrder,
+              const [preferences, credentials] = await Promise.all([
+                tx.spaceModelPreference.findMany({
+                  where: {
+                    spaceId: context.actor.spaceId,
+                    userId: context.actor.userId,
+                    credential: { provider: input.provider },
+                  },
+                  include: { credential: true },
+                }),
+                tx.userModelCredential.findMany({
+                  where: { userId: context.actor.userId, provider: input.provider },
+                }),
+              ]);
+              const choice = chooseModelCredential({
+                provider: input.provider,
+                modelId: input.modelId,
+                preferences,
+                credentials,
               });
+              const credential =
+                choice?.source === "preference" ? choice.preference.credential : choice?.credential;
               if (!credential) {
                 throw new ORPCError("NOT_FOUND", {
                   message: `No model credential is connected for ${input.provider}.`,

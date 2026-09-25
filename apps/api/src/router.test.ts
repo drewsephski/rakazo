@@ -1267,6 +1267,136 @@ describe("codex catalog auth", () => {
   });
 });
 
+describe("model set default auth", () => {
+  const actor = {
+    spaceId: "workspace-1",
+    userId: "user-1",
+    email: "user@rakazo.test",
+    isDeploymentOwner: true,
+  } satisfies Actor;
+  const spark = "gpt-5.3-codex-spark";
+  const luna = "gpt-6-luna";
+  const oauth = JSON.stringify({
+    type: "oauth",
+    access: "access-token",
+    refresh: "refresh-token",
+    expires: Date.now() + 60_000,
+  });
+  const apiKey = "sk-test-api-key-12345678";
+
+  async function call(handler: RPCHandler<never>, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return response;
+  }
+
+  it("sets Spark from the API-key preference when a newer ChatGPT credential exists", async () => {
+    const older = new Date("2026-01-01T00:00:00.000Z");
+    const newer = new Date("2026-02-01T00:00:00.000Z");
+    const apiCredential = {
+      id: "cred-api",
+      userId: actor.userId,
+      provider: "openai-codex",
+      label: "API key",
+      secretId: "secret-api",
+      createdAt: older,
+      updatedAt: older,
+    };
+    const oauthCredential = {
+      id: "cred-oauth",
+      userId: actor.userId,
+      provider: "openai-codex",
+      label: "ChatGPT",
+      secretId: "secret-oauth",
+      createdAt: newer,
+      updatedAt: newer,
+    };
+    const secretFindFirst = vi.fn(async (args: { where: { id?: string } }) => {
+      if (args.where.id === "secret-api") return { id: "secret-api", ciphertext: "cipher-api" };
+      if (args.where.id === "secret-oauth") {
+        return { id: "secret-oauth", ciphertext: "cipher-oauth" };
+      }
+      return null;
+    });
+    const upsert = vi.fn(async () => ({ id: "pref-spark" }));
+    const tx = {
+      userModelCredential: {
+        findMany: vi.fn().mockResolvedValue([oauthCredential, apiCredential]),
+      },
+      spaceModelPreference: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: "pref-spark",
+            modelId: spark,
+            isDefault: false,
+            updatedAt: older,
+            credential: apiCredential,
+          },
+          {
+            id: "pref-luna",
+            modelId: luna,
+            isDefault: true,
+            updatedAt: newer,
+            credential: oauthCredential,
+          },
+        ]),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+        upsert,
+      },
+      secret: { findFirst: secretFindFirst },
+    };
+    const load = vi.fn((ciphertext: string) => (ciphertext === "cipher-oauth" ? oauth : apiKey));
+    const handler = new RPCHandler(
+      createRouter({
+        prisma: {
+          $transaction: vi.fn(async (fn: (client: typeof tx) => unknown) => fn(tx)),
+        },
+        secrets: { load },
+        env: {
+          defaultProvider: "fake",
+          defaultModel: "fake-model",
+          webOrigin: "http://127.0.0.1:5173",
+          screenProxySecret: "fake-test-secret",
+          sandboxProvider: "fake",
+        },
+      } as unknown as RouterDeps),
+    );
+
+    const response = await call(handler, "models/setDefault", {
+      provider: "openai-codex",
+      modelId: spark,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ json: { ok: true } });
+    expect(secretFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "secret-api", userId: actor.userId, spaceId: null }),
+      }),
+    );
+    expect(load).toHaveBeenCalledWith("cipher-api", "secret-api");
+    expect(load).not.toHaveBeenCalledWith("cipher-oauth", "secret-oauth");
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          spaceId_userId_credentialId: {
+            spaceId: actor.spaceId,
+            userId: actor.userId,
+            credentialId: "cred-api",
+          },
+        },
+        update: { modelId: spark, isDefault: true },
+      }),
+    );
+  });
+});
+
 describe("bot model auth on save", () => {
   const actor = {
     spaceId: "workspace-1",

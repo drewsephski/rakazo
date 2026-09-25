@@ -1255,7 +1255,7 @@ describeWithDatabase("API authorization and resource isolation", () => {
     expect(await partialClear.text()).toMatch(/both be set or both cleared/i);
   });
 
-  it("chooses the newest duplicate provider credential when selecting a default", async () => {
+  it("binds a new default to the space preference credential, not a newer unused duplicate", async () => {
     const cookie = await signup(app, `model-duplicates-${stamp}@rakazo.test`, "Model Duplicates");
     const actor = await rpc<Actor>(app, cookie, "me");
     const olderSecret = await handles.prisma.secret.create({
@@ -1313,16 +1313,13 @@ describeWithDatabase("API authorization and resource isolation", () => {
       where: { userId: actor.userId, spaceId: actor.spaceId },
     });
     expect(preferences.filter((row) => row.isDefault).map((row) => row.credentialId)).toEqual([
-      newer.id,
+      older.id,
     ]);
-    expect(preferences.find((row) => row.credentialId === newer.id)).toMatchObject({
+    expect(preferences.find((row) => row.credentialId === older.id)).toMatchObject({
       isDefault: true,
       modelId: "newer/selected",
     });
-    expect(preferences.find((row) => row.credentialId === older.id)).toMatchObject({
-      isDefault: false,
-      modelId: "older/model",
-    });
+    expect(preferences.find((row) => row.credentialId === newer.id)).toBeUndefined();
     const listed = await rpc<ModelCredential[]>(app, cookie, "models/credentials");
     expect(
       listed.filter((row) => row.provider === "duplicate-provider").map((row) => row.id),
