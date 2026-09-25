@@ -46,38 +46,76 @@ export class UnavailableModelForAuthError extends Error {
   }
 }
 
-/** Newest readable credential per provider, used to hide models that sign-in cannot call. */
-export async function modelCredentialAuthKindsForUser(
+/**
+ * Auth kind of the credential each provider would use in this space.
+ * A space preference wins over a newer credential stored on the account.
+ * With no preference, the newest readable credential is the fallback.
+ */
+export async function modelCredentialAuthKindsForSpace(
   prisma: PrismaClient,
   secretStore: Pick<EncryptedSecretStore, "load">,
-  userId: string,
+  scope: Pick<Actor, "userId" | "spaceId">,
 ): Promise<Partial<Record<string, ModelCredentialAuthKind>>> {
-  const rows = await prisma.userModelCredential.findMany({
-    where: { userId },
-    select: { provider: true, secretId: true },
-    orderBy: newestModelCredentialOrder,
-  });
-  if (rows.length === 0) return {};
+  const [credentials, preferences] = await Promise.all([
+    prisma.userModelCredential.findMany({
+      where: { userId: scope.userId },
+      select: { provider: true, secretId: true },
+      orderBy: newestModelCredentialOrder,
+    }),
+    prisma.spaceModelPreference.findMany({
+      where: { userId: scope.userId, spaceId: scope.spaceId },
+      select: { credential: { select: { provider: true, secretId: true } } },
+      orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }, { id: "desc" }],
+    }),
+  ]);
+
+  const selectedSecretId = new Map<string, string>();
+  for (const preference of preferences) {
+    const { provider, secretId } = preference.credential;
+    if (!selectedSecretId.has(provider)) selectedSecretId.set(provider, secretId);
+  }
+  const fallbackSecretIds = new Map<string, string[]>();
+  for (const credential of credentials) {
+    const secretIds = fallbackSecretIds.get(credential.provider) ?? [];
+    secretIds.push(credential.secretId);
+    fallbackSecretIds.set(credential.provider, secretIds);
+  }
+  const providers = new Set([...selectedSecretId.keys(), ...fallbackSecretIds.keys()]);
+  if (providers.size === 0) return {};
+
+  const secretIds = [
+    ...new Set([...selectedSecretId.values(), ...[...fallbackSecretIds.values()].flat()]),
+  ];
   const secrets = await prisma.secret.findMany({
-    where: {
-      id: { in: rows.map((row) => row.secretId) },
-      userId,
-      spaceId: null,
-    },
+    where: { id: { in: secretIds }, userId: scope.userId, spaceId: null },
     select: { id: true, ciphertext: true },
   });
   const ciphertextById = new Map(secrets.map((secret) => [secret.id, secret.ciphertext]));
-  const authByProvider: Partial<Record<string, ModelCredentialAuthKind>> = {};
-  for (const row of rows) {
-    if (authByProvider[row.provider]) continue;
-    const ciphertext = ciphertextById.get(row.secretId);
-    if (!ciphertext) continue;
+  const readKind = (secretId: string): ModelCredentialAuthKind | undefined => {
+    const ciphertext = ciphertextById.get(secretId);
+    if (!ciphertext) return undefined;
     try {
-      authByProvider[row.provider] = modelCredentialAuthKindFromPlaintext(
-        secretStore.load(ciphertext, row.secretId),
-      );
+      return modelCredentialAuthKindFromPlaintext(secretStore.load(ciphertext, secretId));
     } catch {
-      // An unreadable newest credential must not hide an older readable one.
+      return undefined;
+    }
+  };
+
+  const authByProvider: Partial<Record<string, ModelCredentialAuthKind>> = {};
+  for (const provider of providers) {
+    const selected = selectedSecretId.get(provider);
+    if (selected) {
+      const kind = readKind(selected);
+      // The space already chose this credential. An unreadable secret stays
+      // disconnected instead of advertising a newer key the space is not using.
+      if (kind) authByProvider[provider] = kind;
+      continue;
+    }
+    for (const secretId of fallbackSecretIds.get(provider) ?? []) {
+      const kind = readKind(secretId);
+      if (!kind) continue;
+      authByProvider[provider] = kind;
+      break;
     }
   }
   return authByProvider;

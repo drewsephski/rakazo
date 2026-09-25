@@ -58,7 +58,7 @@ import {
   listScratchpadItems,
   McpOAuthBroker,
   mapScratchpadItem,
-  modelCredentialAuthKindsForUser,
+  modelCredentialAuthKindsForSpace,
   modelCredentialDto,
   pickReusableConnection,
   planLiveConnectionSync,
@@ -829,10 +829,10 @@ export function createRouter(deps: RouterDeps) {
     },
     models: {
       list: authed.models.list.handler(async ({ context }) => {
-        const authByProvider = await modelCredentialAuthKindsForUser(
+        const authByProvider = await modelCredentialAuthKindsForSpace(
           deps.prisma,
           deps.secrets,
-          context.actor.userId,
+          context.actor,
         );
         return [...listAvailablePiCatalog(authByProvider), scriptedCatalogEntry];
       }),
@@ -1084,11 +1084,19 @@ export function createRouter(deps: RouterDeps) {
           });
           if (!section) throw new IsolationError();
         }
-        if (input.modelProvider && input.modelId) {
+        // Web settings resend the saved model on every save. Reject an
+        // incompatible override only when this request is changing it; a run
+        // still rejects a Spark model the subscription sign-in cannot call.
+        const settingModel =
+          input.modelProvider !== undefined &&
+          input.modelId !== undefined &&
+          (input.modelProvider !== existing.modelProvider || input.modelId !== existing.modelId);
+        if (settingModel && input.modelProvider && input.modelId) {
           const credential = await findModelCredential(
             deps.prisma,
             context.actor,
             input.modelProvider,
+            input.modelId,
           );
           if (!credential) {
             throw new ORPCError("BAD_REQUEST", { message: "Connect that model provider first" });

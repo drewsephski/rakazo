@@ -1178,3 +1178,323 @@ describe("bot intro run", () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 });
+
+describe("codex catalog auth", () => {
+  const actor = {
+    spaceId: "workspace-1",
+    userId: "user-1",
+    email: "user@rakazo.test",
+    isDeploymentOwner: true,
+  } satisfies Actor;
+  const spark = "gpt-5.3-codex-spark";
+  const luna = "gpt-6-luna";
+  const oauth = JSON.stringify({
+    type: "oauth",
+    access: "access-token",
+    refresh: "refresh-token",
+    expires: Date.now() + 60_000,
+  });
+  const apiKey = "sk-test-api-key-12345678";
+
+  async function call(handler: RPCHandler<never>, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return response;
+  }
+
+  function catalogDeps() {
+    const load = vi.fn((ciphertext: string) => (ciphertext === "cipher-oauth" ? oauth : apiKey));
+    const prisma = {
+      userModelCredential: {
+        findMany: vi.fn().mockResolvedValue([
+          { provider: "openai-codex", secretId: "secret-api" },
+          { provider: "openai-codex", secretId: "secret-oauth" },
+        ]),
+      },
+      spaceModelPreference: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([
+            { credential: { provider: "openai-codex", secretId: "secret-oauth" } },
+          ]),
+      },
+      secret: {
+        findMany: vi.fn().mockResolvedValue([{ id: "secret-oauth", ciphertext: "cipher-oauth" }]),
+      },
+    };
+    const deps = {
+      prisma,
+      secrets: { load },
+      env: {
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+    } as unknown as RouterDeps;
+    return { load, prisma, handler: new RPCHandler(createRouter(deps)) };
+  }
+
+  it("hides Codex Spark for the space's ChatGPT credential when a newer key exists", async () => {
+    const { load, prisma, handler } = catalogDeps();
+
+    const response = await call(handler, "models/list", null);
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      json: Array<{ provider: string; id: string }>;
+    };
+    expect(body.json.some((entry) => entry.provider === "openai-codex" && entry.id === spark)).toBe(
+      false,
+    );
+    expect(body.json.some((entry) => entry.provider === "openai-codex" && entry.id === luna)).toBe(
+      true,
+    );
+    expect(prisma.spaceModelPreference.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: actor.userId, spaceId: actor.spaceId },
+      }),
+    );
+    expect(load).toHaveBeenCalledWith("cipher-oauth", "secret-oauth");
+    expect(load).not.toHaveBeenCalledWith("cipher-api", "secret-api");
+  });
+});
+
+describe("bot model auth on save", () => {
+  const actor = {
+    spaceId: "workspace-1",
+    userId: "user-1",
+    email: "user@rakazo.test",
+    isDeploymentOwner: true,
+  } satisfies Actor;
+  const spark = "gpt-5.3-codex-spark";
+  const luna = "gpt-6-luna";
+  const oauth = JSON.stringify({
+    type: "oauth",
+    access: "access-token",
+    refresh: "refresh-token",
+    expires: Date.now() + 60_000,
+  });
+  const apiKey = "sk-test-api-key-12345678";
+
+  async function call(handler: RPCHandler<never>, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return response;
+  }
+
+  function storedBot(modelId: string) {
+    const now = new Date("2026-01-01T00:00:00.000Z");
+    return {
+      id: "bot-1",
+      spaceId: actor.spaceId,
+      userId: actor.userId,
+      name: "Ada",
+      title: "",
+      description: "",
+      instructions: "",
+      color: "ink",
+      notifyOnFinish: true,
+      pinned: false,
+      position: 0,
+      sectionId: null,
+      archivedAt: null,
+      parentBotId: null,
+      memoryScope: null,
+      createdAt: now,
+      updatedAt: now,
+      voiceId: null,
+      autoSpeak: false,
+      modelProvider: "openai-codex",
+      modelId,
+      thinkingLevel: null,
+      teamChatAmbientEnabled: false,
+      teamChatRules: "",
+      webhookSecretId: null,
+      spawnKey: null,
+      thread: { id: "thread-1", unread: false, messages: [] },
+      computer: null,
+      runs: [],
+    };
+  }
+
+  function credentialRow(id: string, secretId: string) {
+    return {
+      id,
+      userId: actor.userId,
+      provider: "openai-codex",
+      label: "ChatGPT",
+      secretId,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+  }
+
+  function saveDeps(options: {
+    modelId: string;
+    preferences: (args: { where: { modelId?: string; credential?: { provider?: string } } }) => {
+      credential: ReturnType<typeof credentialRow>;
+      isDefault: boolean;
+      modelId: string;
+    } | null;
+  }) {
+    const bot = storedBot(options.modelId);
+    const preferenceFindFirst = vi.fn(options.preferences);
+    const secretFindFirst = vi.fn(async (args: { where: { id?: string } }) => {
+      if (args.where.id === "secret-api") {
+        return { id: "secret-api", ciphertext: "cipher-api" };
+      }
+      if (args.where.id === "secret-oauth") {
+        return { id: "secret-oauth", ciphertext: "cipher-oauth" };
+      }
+      return null;
+    });
+    const botUpdate = vi.fn(async () => ({
+      id: bot.id,
+      name: "Ada renamed",
+      title: bot.title,
+      description: bot.description,
+    }));
+    const tx = {
+      bot: { update: botUpdate },
+      thread: { update: vi.fn(async () => ({ nextEventSeq: 2 })) },
+      event: { create: vi.fn(async () => ({ seq: 1 })) },
+    };
+    const prisma = {
+      bot: {
+        findFirst: vi.fn(async () => bot),
+        findMany: vi.fn(async () => [{ ...bot, name: "Ada renamed" }]),
+        update: botUpdate,
+      },
+      spaceModelPreference: { findFirst: preferenceFindFirst },
+      userModelCredential: { findFirst: vi.fn(async () => null) },
+      secret: { findFirst: secretFindFirst },
+      $transaction: vi.fn(async (fn: (client: typeof tx) => unknown) => fn(tx)),
+    };
+    const deps = {
+      prisma,
+      secrets: {
+        load: (ciphertext: string) => (ciphertext === "cipher-oauth" ? oauth : apiKey),
+      },
+      events: { notify: vi.fn().mockResolvedValue(undefined) },
+      env: {
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+    } as unknown as RouterDeps;
+    return {
+      preferenceFindFirst,
+      secretFindFirst,
+      botUpdate,
+      handler: new RPCHandler(createRouter(deps)),
+    };
+  }
+
+  it("saves a rename while resending an existing Spark override", async () => {
+    const { preferenceFindFirst, secretFindFirst, botUpdate, handler } = saveDeps({
+      modelId: spark,
+      preferences: () => null,
+    });
+
+    const response = await call(handler, "bots/update", {
+      botId: "bot-1",
+      name: "Ada renamed",
+      modelProvider: "openai-codex",
+      modelId: spark,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      json: expect.objectContaining({ id: "bot-1", name: "Ada renamed", modelId: spark }),
+    });
+    expect(preferenceFindFirst).not.toHaveBeenCalled();
+    expect(secretFindFirst).not.toHaveBeenCalled();
+    expect(botUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ name: "Ada renamed", modelId: spark }),
+      }),
+    );
+  });
+
+  it("rejects setting Codex Spark on the space's ChatGPT subscription credential", async () => {
+    const oauthCredential = credentialRow("cred-oauth", "secret-oauth");
+    const { preferenceFindFirst, handler } = saveDeps({
+      modelId: luna,
+      preferences: (args) => {
+        if (args.where.modelId) return null;
+        if (args.where.credential?.provider === "openai-codex") {
+          return { credential: oauthCredential, isDefault: true, modelId: luna };
+        }
+        return null;
+      },
+    });
+
+    const response = await call(handler, "bots/update", {
+      botId: "bot-1",
+      modelProvider: "openai-codex",
+      modelId: spark,
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      json: expect.objectContaining({
+        code: "BAD_REQUEST",
+        message: expect.stringMatching(/not available with your current sign-in/i),
+      }),
+    });
+    expect(preferenceFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          modelId: spark,
+          credential: { provider: "openai-codex" },
+        }),
+      }),
+    );
+  });
+
+  it("accepts Spark when the preference that owns that model is an API key", async () => {
+    const apiCredential = credentialRow("cred-api", "secret-api");
+    const oauthCredential = credentialRow("cred-oauth", "secret-oauth");
+    const { secretFindFirst, handler } = saveDeps({
+      modelId: luna,
+      preferences: (args) => {
+        if (args.where.modelId === spark) {
+          return { credential: apiCredential, isDefault: false, modelId: spark };
+        }
+        if (args.where.credential?.provider === "openai-codex") {
+          return { credential: oauthCredential, isDefault: true, modelId: luna };
+        }
+        return null;
+      },
+    });
+
+    const response = await call(handler, "bots/update", {
+      botId: "bot-1",
+      modelProvider: "openai-codex",
+      modelId: spark,
+    });
+
+    expect(response.status).toBe(200);
+    expect(secretFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "secret-api", userId: actor.userId, spaceId: null }),
+      }),
+    );
+  });
+});
