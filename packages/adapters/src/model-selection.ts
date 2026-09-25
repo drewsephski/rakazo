@@ -2,9 +2,9 @@ import type { AgentRunRequest } from "@rakazo/adapter-kit";
 import type { Actor } from "@rakazo/contracts";
 import { usableModelId } from "@rakazo/contracts";
 import {
+  chooseModelCredential,
   type findDefaultModelCredential,
   findModelCredential,
-  newestModelCredentialOrder,
   type PrismaClient,
 } from "@rakazo/db";
 import type { ModelCredentialAuthKind } from "./pi-catalog-availability.js";
@@ -46,48 +46,98 @@ export class UnavailableModelForAuthError extends Error {
   }
 }
 
+export type SpaceCatalogAuth = {
+  byProvider: Partial<Record<string, ModelCredentialAuthKind>>;
+  /** Model-specific kinds. `"disconnected"` blocks the provider fallback. */
+  byModel: Partial<
+    Record<string, Partial<Record<string, ModelCredentialAuthKind | "disconnected">>>
+  >;
+};
+
 /**
- * Auth kind of the credential each provider would use in this space.
- * A space preference wins over a newer credential stored on the account.
- * With no preference, the newest readable credential is the fallback.
+ * Auth kinds for the credentials `chooseModelCredential` would select in this space.
+ * Each catalog model uses the preference that owns that model id, then the provider
+ * preference, then the newest account credential. An unreadable selected secret stays
+ * disconnected instead of falling through to an older key.
  */
 export async function modelCredentialAuthKindsForSpace(
   prisma: PrismaClient,
   secretStore: Pick<EncryptedSecretStore, "load">,
   scope: Pick<Actor, "userId" | "spaceId">,
-): Promise<Partial<Record<string, ModelCredentialAuthKind>>> {
+): Promise<SpaceCatalogAuth> {
   const [credentials, preferences] = await Promise.all([
     prisma.userModelCredential.findMany({
       where: { userId: scope.userId },
-      select: { provider: true, secretId: true },
-      orderBy: newestModelCredentialOrder,
+      select: {
+        id: true,
+        provider: true,
+        secretId: true,
+        updatedAt: true,
+        createdAt: true,
+      },
     }),
     prisma.spaceModelPreference.findMany({
       where: { userId: scope.userId, spaceId: scope.spaceId },
-      select: { credential: { select: { provider: true, secretId: true } } },
-      orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }, { id: "desc" }],
+      select: {
+        id: true,
+        modelId: true,
+        isDefault: true,
+        updatedAt: true,
+        credential: {
+          select: {
+            id: true,
+            provider: true,
+            secretId: true,
+            updatedAt: true,
+            createdAt: true,
+          },
+        },
+      },
     }),
   ]);
-
-  const selectedSecretId = new Map<string, string>();
-  for (const preference of preferences) {
-    const { provider, secretId } = preference.credential;
-    if (!selectedSecretId.has(provider)) selectedSecretId.set(provider, secretId);
+  const connectedProviders = new Set([
+    ...credentials.map((credential) => credential.provider),
+    ...preferences.map((preference) => preference.credential.provider),
+  ]);
+  const selections: Array<{
+    provider: string;
+    modelId: string;
+    secretId: string;
+    modelSpecific: boolean;
+  }> = [];
+  for (const entry of listPiCatalog()) {
+    if (!connectedProviders.has(entry.provider)) continue;
+    const choice = chooseModelCredential({
+      provider: entry.provider,
+      modelId: entry.id,
+      preferences,
+      credentials,
+    });
+    if (!choice) continue;
+    const secretId =
+      choice.source === "preference"
+        ? choice.preference.credential.secretId
+        : choice.credential.secretId;
+    const requestedModelId = usableModelId(entry.id);
+    selections.push({
+      provider: entry.provider,
+      modelId: entry.id,
+      secretId,
+      modelSpecific:
+        choice.source === "preference" &&
+        requestedModelId !== null &&
+        choice.preference.modelId === requestedModelId,
+    });
   }
-  const fallbackSecretIds = new Map<string, string[]>();
-  for (const credential of credentials) {
-    const secretIds = fallbackSecretIds.get(credential.provider) ?? [];
-    secretIds.push(credential.secretId);
-    fallbackSecretIds.set(credential.provider, secretIds);
-  }
-  const providers = new Set([...selectedSecretId.keys(), ...fallbackSecretIds.keys()]);
-  if (providers.size === 0) return {};
+  const empty: SpaceCatalogAuth = { byProvider: {}, byModel: {} };
+  if (selections.length === 0) return empty;
 
-  const secretIds = [
-    ...new Set([...selectedSecretId.values(), ...[...fallbackSecretIds.values()].flat()]),
-  ];
   const secrets = await prisma.secret.findMany({
-    where: { id: { in: secretIds }, userId: scope.userId, spaceId: null },
+    where: {
+      id: { in: [...new Set(selections.map((selection) => selection.secretId))] },
+      userId: scope.userId,
+      spaceId: null,
+    },
     select: { id: true, ciphertext: true },
   });
   const ciphertextById = new Map(secrets.map((secret) => [secret.id, secret.ciphertext]));
@@ -101,24 +151,18 @@ export async function modelCredentialAuthKindsForSpace(
     }
   };
 
-  const authByProvider: Partial<Record<string, ModelCredentialAuthKind>> = {};
-  for (const provider of providers) {
-    const selected = selectedSecretId.get(provider);
-    if (selected) {
-      const kind = readKind(selected);
-      // The space already chose this credential. An unreadable secret stays
-      // disconnected instead of advertising a newer key the space is not using.
-      if (kind) authByProvider[provider] = kind;
+  const auth: SpaceCatalogAuth = { byProvider: {}, byModel: {} };
+  for (const selection of selections) {
+    const kind = readKind(selection.secretId);
+    if (selection.modelSpecific) {
+      const models = auth.byModel[selection.provider] ?? {};
+      models[selection.modelId] = kind ?? "disconnected";
+      auth.byModel[selection.provider] = models;
       continue;
     }
-    for (const secretId of fallbackSecretIds.get(provider) ?? []) {
-      const kind = readKind(secretId);
-      if (!kind) continue;
-      authByProvider[provider] = kind;
-      break;
-    }
+    if (kind) auth.byProvider[selection.provider] = kind;
   }
-  return authByProvider;
+  return auth;
 }
 
 export function validateModelAuthAvailability(

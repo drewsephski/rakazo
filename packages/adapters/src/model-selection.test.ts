@@ -165,18 +165,46 @@ describe("space catalog auth", () => {
   });
   const apiKey = "sk-test-api-key-12345678";
   const spark = "gpt-5.3-codex-spark";
+  const luna = "gpt-6-luna";
+
+  function stamp(iso: string) {
+    return new Date(iso);
+  }
+
+  function storedCredential(id: string, secretId: string, iso: string) {
+    return {
+      id,
+      provider: "openai-codex",
+      secretId,
+      updatedAt: stamp(iso),
+      createdAt: stamp(iso),
+    };
+  }
+
+  function storedPreference(input: {
+    id: string;
+    modelId: string | null;
+    isDefault: boolean;
+    credentialId: string;
+    secretId: string;
+    iso: string;
+  }) {
+    return {
+      id: input.id,
+      modelId: input.modelId,
+      isDefault: input.isDefault,
+      updatedAt: stamp(input.iso),
+      credential: storedCredential(input.credentialId, input.secretId, input.iso),
+    };
+  }
 
   function authPrisma(options: {
-    credentials: Array<{ provider: string; secretId: string }>;
-    preferences: Array<{ provider: string; secretId: string }>;
+    credentials: ReturnType<typeof storedCredential>[];
+    preferences: ReturnType<typeof storedPreference>[];
     secrets: Array<{ id: string; ciphertext: string }>;
   }) {
     const credentialFindMany = vi.fn().mockResolvedValue(options.credentials);
-    const preferenceFindMany = vi.fn().mockResolvedValue(
-      options.preferences.map((preference) => ({
-        credential: { provider: preference.provider, secretId: preference.secretId },
-      })),
-    );
+    const preferenceFindMany = vi.fn().mockResolvedValue(options.preferences);
     const secretFindMany = vi.fn().mockResolvedValue(options.secrets);
     const prisma = {
       userModelCredential: { findMany: credentialFindMany },
@@ -186,57 +214,137 @@ describe("space catalog auth", () => {
     return { prisma, credentialFindMany, preferenceFindMany, secretFindMany };
   }
 
-  it("uses the space's selected openai-codex credential instead of the newest one", async () => {
+  function listsSpark(auth: Awaited<ReturnType<typeof modelCredentialAuthKindsForSpace>>) {
+    return listAvailablePiCatalog(auth.byProvider, auth.byModel).some(
+      (entry) => entry.provider === "openai-codex" && entry.id === spark,
+    );
+  }
+
+  it("uses the space preference instead of a newer account credential", async () => {
     const { prisma, preferenceFindMany } = authPrisma({
       credentials: [
-        { provider: "openai-codex", secretId: "secret-api" },
-        { provider: "openai-codex", secretId: "secret-oauth" },
+        storedCredential("cred-api", "secret-api", "2026-03-01T00:00:00.000Z"),
+        storedCredential("cred-oauth", "secret-oauth", "2026-01-01T00:00:00.000Z"),
       ],
-      preferences: [{ provider: "openai-codex", secretId: "secret-oauth" }],
+      preferences: [
+        storedPreference({
+          id: "pref-oauth",
+          modelId: luna,
+          isDefault: true,
+          credentialId: "cred-oauth",
+          secretId: "secret-oauth",
+          iso: "2026-01-02T00:00:00.000Z",
+        }),
+      ],
       secrets: [{ id: "secret-oauth", ciphertext: "cipher-oauth" }],
     });
     const load = vi.fn((ciphertext: string) => (ciphertext === "cipher-oauth" ? oauth : apiKey));
 
     const auth = await modelCredentialAuthKindsForSpace(prisma, { load }, scope);
 
-    expect(auth).toEqual({ "openai-codex": "oauth" });
+    expect(auth.byProvider["openai-codex"]).toBe("oauth");
     expect(preferenceFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { userId: scope.userId, spaceId: scope.spaceId },
       }),
     );
-    expect(
-      listAvailablePiCatalog(auth).some(
-        (entry) => entry.provider === "openai-codex" && entry.id === spark,
-      ),
-    ).toBe(false);
+    expect(listsSpark(auth)).toBe(false);
+    expect(load).not.toHaveBeenCalledWith("cipher-api", "secret-api");
   });
 
-  it("keeps Spark when the space preference is an API key and a newer credential is oauth", async () => {
+  it("shows Spark from the preference that owns that model when the default is ChatGPT sign-in", async () => {
     const { prisma } = authPrisma({
       credentials: [
-        { provider: "openai-codex", secretId: "secret-oauth" },
-        { provider: "openai-codex", secretId: "secret-api" },
+        storedCredential("cred-api", "secret-api", "2026-02-01T00:00:00.000Z"),
+        storedCredential("cred-oauth", "secret-oauth", "2026-03-01T00:00:00.000Z"),
       ],
-      preferences: [{ provider: "openai-codex", secretId: "secret-api" }],
-      secrets: [{ id: "secret-api", ciphertext: "cipher-api" }],
+      preferences: [
+        storedPreference({
+          id: "pref-oauth",
+          modelId: luna,
+          isDefault: true,
+          credentialId: "cred-oauth",
+          secretId: "secret-oauth",
+          iso: "2026-03-02T00:00:00.000Z",
+        }),
+        storedPreference({
+          id: "pref-spark",
+          modelId: spark,
+          isDefault: false,
+          credentialId: "cred-api",
+          secretId: "secret-api",
+          iso: "2026-02-02T00:00:00.000Z",
+        }),
+      ],
+      secrets: [
+        { id: "secret-oauth", ciphertext: "cipher-oauth" },
+        { id: "secret-api", ciphertext: "cipher-api" },
+      ],
     });
+    const load = vi.fn((_ciphertext: string, secretId: string) =>
+      secretId === "secret-oauth" ? oauth : apiKey,
+    );
 
-    const auth = await modelCredentialAuthKindsForSpace(prisma, { load: () => apiKey }, scope);
+    const auth = await modelCredentialAuthKindsForSpace(prisma, { load }, scope);
 
-    expect(auth).toEqual({ "openai-codex": "api_key" });
+    expect(auth.byModel["openai-codex"]?.[spark]).toBe("api_key");
+    expect(auth.byProvider["openai-codex"]).toBe("oauth");
+    expect(listsSpark(auth)).toBe(true);
     expect(
-      listAvailablePiCatalog(auth).some(
-        (entry) => entry.provider === "openai-codex" && entry.id === spark,
+      listAvailablePiCatalog(auth.byProvider, auth.byModel).some(
+        (entry) => entry.provider === "openai-codex" && entry.id === luna,
       ),
     ).toBe(true);
   });
 
-  it("falls back to the newest readable credential when the space has no preference", async () => {
+  it("hides Spark when the preference that owns it is ChatGPT sign-in", async () => {
     const { prisma } = authPrisma({
       credentials: [
-        { provider: "openai-codex", secretId: "secret-broken" },
-        { provider: "openai-codex", secretId: "secret-api" },
+        storedCredential("cred-api", "secret-api", "2026-03-01T00:00:00.000Z"),
+        storedCredential("cred-oauth", "secret-oauth", "2026-01-01T00:00:00.000Z"),
+      ],
+      preferences: [
+        storedPreference({
+          id: "pref-api",
+          modelId: luna,
+          isDefault: true,
+          credentialId: "cred-api",
+          secretId: "secret-api",
+          iso: "2026-03-02T00:00:00.000Z",
+        }),
+        storedPreference({
+          id: "pref-spark",
+          modelId: spark,
+          isDefault: false,
+          credentialId: "cred-oauth",
+          secretId: "secret-oauth",
+          iso: "2026-02-02T00:00:00.000Z",
+        }),
+      ],
+      secrets: [
+        { id: "secret-api", ciphertext: "cipher-api" },
+        { id: "secret-oauth", ciphertext: "cipher-oauth" },
+      ],
+    });
+
+    const auth = await modelCredentialAuthKindsForSpace(
+      prisma,
+      {
+        load: (_ciphertext: string, secretId: string) =>
+          secretId === "secret-oauth" ? oauth : apiKey,
+      },
+      scope,
+    );
+
+    expect(auth.byModel["openai-codex"]?.[spark]).toBe("oauth");
+    expect(listsSpark(auth)).toBe(false);
+  });
+
+  it("does not replace an unreadable newest credential with an older API key", async () => {
+    const { prisma, secretFindMany } = authPrisma({
+      credentials: [
+        storedCredential("cred-older", "secret-api", "2026-01-01T00:00:00.000Z"),
+        storedCredential("cred-newest", "secret-broken", "2026-03-01T00:00:00.000Z"),
       ],
       preferences: [],
       secrets: [
@@ -249,33 +357,57 @@ describe("space catalog auth", () => {
       return apiKey;
     });
 
-    await expect(modelCredentialAuthKindsForSpace(prisma, { load }, scope)).resolves.toEqual({
-      "openai-codex": "api_key",
-    });
+    const auth = await modelCredentialAuthKindsForSpace(prisma, { load }, scope);
+
+    expect(secretFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: { in: ["secret-broken"] } }),
+      }),
+    );
+    expect(auth.byProvider).toEqual({});
+    expect(auth.byModel).toEqual({});
+    expect(listsSpark(auth)).toBe(false);
+    expect(load).not.toHaveBeenCalledWith("cipher-api", "secret-api");
   });
 
-  it("does not replace an unreadable space credential with a newer API key", async () => {
+  it("does not replace an unreadable model preference with the provider default", async () => {
     const { prisma } = authPrisma({
-      credentials: [{ provider: "openai-codex", secretId: "secret-api" }],
-      preferences: [{ provider: "openai-codex", secretId: "secret-oauth" }],
+      credentials: [
+        storedCredential("cred-api", "secret-api", "2026-03-01T00:00:00.000Z"),
+        storedCredential("cred-oauth", "secret-oauth", "2026-01-01T00:00:00.000Z"),
+      ],
+      preferences: [
+        storedPreference({
+          id: "pref-api",
+          modelId: luna,
+          isDefault: true,
+          credentialId: "cred-api",
+          secretId: "secret-api",
+          iso: "2026-03-02T00:00:00.000Z",
+        }),
+        storedPreference({
+          id: "pref-spark",
+          modelId: spark,
+          isDefault: false,
+          credentialId: "cred-oauth",
+          secretId: "secret-oauth",
+          iso: "2026-02-02T00:00:00.000Z",
+        }),
+      ],
       secrets: [
-        { id: "secret-oauth", ciphertext: "cipher-oauth" },
         { id: "secret-api", ciphertext: "cipher-api" },
+        { id: "secret-oauth", ciphertext: "cipher-oauth" },
       ],
     });
-    const load = vi.fn((ciphertext: string) => {
-      if (ciphertext === "cipher-oauth") throw new Error("unreadable");
+    const load = vi.fn((_ciphertext: string, secretId: string) => {
+      if (secretId === "secret-oauth") throw new Error("unreadable");
       return apiKey;
     });
 
     const auth = await modelCredentialAuthKindsForSpace(prisma, { load }, scope);
 
-    expect(auth).toEqual({});
-    expect(
-      listAvailablePiCatalog(auth).some(
-        (entry) => entry.provider === "openai-codex" && entry.id === spark,
-      ),
-    ).toBe(false);
+    expect(auth.byModel["openai-codex"]?.[spark]).toBe("disconnected");
+    expect(listsSpark(auth)).toBe(false);
   });
 });
 

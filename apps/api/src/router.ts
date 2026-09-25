@@ -853,12 +853,12 @@ export function createRouter(deps: RouterDeps) {
     },
     models: {
       list: authed.models.list.handler(async ({ context }) => {
-        const authByProvider = await modelCredentialAuthKindsForSpace(
+        const auth = await modelCredentialAuthKindsForSpace(
           deps.prisma,
           deps.secrets,
           context.actor,
         );
-        return [...listAvailablePiCatalog(authByProvider), scriptedCatalogEntry];
+        return [...listAvailablePiCatalog(auth.byProvider, auth.byModel), scriptedCatalogEntry];
       }),
       credentials: authed.models.credentials.handler(async ({ context }) => {
         const rows = await deps.prisma.userModelCredential.findMany({

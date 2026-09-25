@@ -45,12 +45,15 @@ export function catalogModelAvailableForAuth(
 /** Catalog entries the given provider credentials can actually call. */
 export function listAvailablePiCatalog(
   authByProvider: Readonly<Partial<Record<string, ModelCredentialAuthKind>>> = {},
+  authByModel: Readonly<
+    Partial<Record<string, Partial<Record<string, ModelCredentialAuthKind | "disconnected">>>>
+  > = {},
 ): PiCatalogEntry[] {
   return listPiCatalog().filter((entry) =>
     catalogModelAvailableForAuth(
       entry.provider,
       entry.id,
-      authByProvider[entry.provider] ?? "disconnected",
+      authByModel[entry.provider]?.[entry.id] ?? authByProvider[entry.provider] ?? "disconnected",
       entry.auth,
     ),
   );

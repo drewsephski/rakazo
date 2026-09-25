@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PrismaClient } from "./client.js";
 import {
+  chooseModelCredential,
   findDefaultModelCredential,
   findModelCredential,
   newestModelCredentialOrder,
@@ -110,6 +111,128 @@ describe("findModelCredential", () => {
       orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }, { id: "desc" }],
     });
     expect(preferenceFindFirst).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses chooseModelCredential when the client can list every candidate", async () => {
+    const older = {
+      id: "credential-older",
+      userId: "user",
+      provider: "openai-codex",
+      label: "Older",
+      secretId: "secret-older",
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+    };
+    const newer = {
+      id: "credential-newer",
+      userId: "user",
+      provider: "openai-codex",
+      label: "Newer",
+      secretId: "secret-newer",
+      createdAt: new Date("2026-02-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-02-02T00:00:00.000Z"),
+    };
+    const sparkPreference = {
+      id: "pref-spark",
+      modelId: "gpt-5.3-codex-spark",
+      isDefault: false,
+      updatedAt: new Date("2026-02-03T00:00:00.000Z"),
+      credential: older,
+    };
+    const defaultPreference = {
+      id: "pref-default",
+      modelId: "gpt-6-luna",
+      isDefault: true,
+      updatedAt: new Date("2026-03-01T00:00:00.000Z"),
+      credential: newer,
+    };
+    const preferenceFindMany = vi.fn().mockResolvedValue([defaultPreference, sparkPreference]);
+    const credentialFindMany = vi.fn().mockResolvedValue([older, newer]);
+    const prisma = {
+      spaceModelPreference: { findMany: preferenceFindMany },
+      userModelCredential: { findMany: credentialFindMany },
+    } as unknown as PrismaClient;
+
+    await expect(
+      findModelCredential(
+        prisma,
+        { userId: "user", spaceId: "space" },
+        "openai-codex",
+        "gpt-5.3-codex-spark",
+      ),
+    ).resolves.toEqual({
+      ...older,
+      isDefault: false,
+      defaultModel: "gpt-5.3-codex-spark",
+    });
+    await expect(
+      findModelCredential(
+        prisma,
+        { userId: "user", spaceId: "space" },
+        "openai-codex",
+        "gpt-6-luna",
+      ),
+    ).resolves.toEqual({
+      ...newer,
+      isDefault: true,
+      defaultModel: "gpt-6-luna",
+    });
+  });
+});
+
+describe("chooseModelCredential", () => {
+  function credential(id: string, iso: string) {
+    const at = new Date(iso);
+    return {
+      id,
+      provider: "openai-codex",
+      secretId: `secret-${id}`,
+      updatedAt: at,
+      createdAt: at,
+    };
+  }
+
+  it("prefers the preference that owns the model id over the default", () => {
+    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
+    const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
+    const choice = chooseModelCredential({
+      provider: "openai-codex",
+      modelId: "gpt-5.3-codex-spark",
+      preferences: [
+        {
+          id: "pref-default",
+          modelId: "gpt-6-luna",
+          isDefault: true,
+          updatedAt: new Date("2026-03-02T00:00:00.000Z"),
+          credential: oauth,
+        },
+        {
+          id: "pref-spark",
+          modelId: "gpt-5.3-codex-spark",
+          isDefault: false,
+          updatedAt: new Date("2026-02-01T00:00:00.000Z"),
+          credential: apiKey,
+        },
+      ],
+      credentials: [oauth, apiKey],
+    });
+    expect(choice).toEqual({
+      source: "preference",
+      preference: expect.objectContaining({ credential: apiKey }),
+    });
+  });
+
+  it("keeps the newest account credential when the space has no preference", () => {
+    const older = credential("older", "2026-01-01T00:00:00.000Z");
+    const newest = credential("newest", "2026-04-01T00:00:00.000Z");
+    expect(
+      chooseModelCredential({
+        provider: "openai-codex",
+        modelId: "gpt-5.3-codex-spark",
+        preferences: [],
+        credentials: [older, newest],
+      }),
+    ).toEqual({ source: "credential", credential: newest });
   });
 });
 
