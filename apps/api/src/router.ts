@@ -53,10 +53,12 @@ import {
   isComputerScreenUnavailable,
   isSandboxGoneError,
   isScratchpadStatus,
+  listAvailablePiCatalog,
   listPiCatalog,
   listScratchpadItems,
   McpOAuthBroker,
   mapScratchpadItem,
+  modelCredentialAuthKindsForUser,
   modelCredentialDto,
   pickReusableConnection,
   planLiveConnectionSync,
@@ -79,6 +81,8 @@ import {
   takeoverLeaseMs,
   toComputerRef,
   touchRunningComputer,
+  validateModelAuthAvailability,
+  validateStoredModelAuth,
   verifyMcpInstall,
 } from "@rakazo/adapters";
 import type { Auth } from "@rakazo/auth";
@@ -824,7 +828,14 @@ export function createRouter(deps: RouterDeps) {
       }),
     },
     models: {
-      list: authed.models.list.handler(async () => [...listPiCatalog(), scriptedCatalogEntry]),
+      list: authed.models.list.handler(async ({ context }) => {
+        const authByProvider = await modelCredentialAuthKindsForUser(
+          deps.prisma,
+          deps.secrets,
+          context.actor.userId,
+        );
+        return [...listAvailablePiCatalog(authByProvider), scriptedCatalogEntry];
+      }),
       credentials: authed.models.credentials.handler(async ({ context }) => {
         const rows = await deps.prisma.userModelCredential.findMany({
           where: { userId: context.actor.userId },
@@ -978,6 +989,15 @@ export function createRouter(deps: RouterDeps) {
                   message: `No model credential is connected for ${input.provider}.`,
                 });
               }
+              const authError = await validateStoredModelAuth(
+                tx,
+                deps.secrets,
+                context.actor.userId,
+                credential.secretId,
+                input.provider,
+                input.modelId,
+              );
+              if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
               await selectSpaceModelPreference(tx, context.actor, credential.id, input.modelId);
             },
             { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -1079,6 +1099,17 @@ export function createRouter(deps: RouterDeps) {
           );
           if (!inCatalog && credential.defaultModel !== input.modelId) {
             throw new ORPCError("BAD_REQUEST", { message: "Unknown model for that provider" });
+          }
+          if (inCatalog) {
+            const authError = await validateStoredModelAuth(
+              deps.prisma,
+              deps.secrets,
+              context.actor.userId,
+              credential.secretId,
+              input.modelProvider,
+              input.modelId,
+            );
+            if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
           }
         }
         const thinkingLevel = input.thinkingLevel;
@@ -5194,6 +5225,11 @@ async function persistModelCredential(
   },
 ) {
   throwIfAborted(input.signal);
+  const requestedModelId = usableModelId(input.modelId);
+  const authError = requestedModelId
+    ? validateModelAuthAvailability(input.provider, requestedModelId, input.plaintext)
+    : undefined;
+  if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
   const stored = await deps.secrets.put(input.plaintext, {
     operationId: "cred",
     traceId: "cred",
@@ -5243,8 +5279,8 @@ async function persistModelCredential(
             });
         throwIfAborted(input.signal);
         const defaultModel =
-          usableModelId(input.modelId) ??
-          defaultCatalogModelId(input.provider) ??
+          requestedModelId ??
+          defaultCatalogModelId(input.provider, input.plaintext) ??
           usableModelId(deps.env.defaultModel);
         await selectSpaceModelPreference(tx, actor, credential.id, defaultModel);
         throwIfAborted(input.signal);

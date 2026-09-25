@@ -5,6 +5,7 @@ import {
   defaultCatalogModelId,
   selectConfiguredModel,
   validateConnectedModelChoice,
+  validateModelAuthAvailability,
 } from "./model-selection.js";
 
 type SelectionInput = Parameters<typeof selectConfiguredModel>[0];
@@ -136,6 +137,37 @@ describe("configured model selection", () => {
     },
   ])("$name", ({ input, expected }) => {
     expect(selectConfiguredModel({ ...defaults, ...input })).toEqual(expected);
+  });
+});
+
+describe("defaultCatalogModelId", () => {
+  it("skips Codex Spark as the default for ChatGPT subscription credentials", () => {
+    const oauth = JSON.stringify({
+      type: "oauth",
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: Date.now() + 60_000,
+    });
+    expect(defaultCatalogModelId("openai-codex", oauth)).not.toBe("gpt-5.3-codex-spark");
+    expect(defaultCatalogModelId("openai-codex", oauth)).toBeTruthy();
+  });
+});
+
+describe("model auth availability", () => {
+  it("rejects Codex Spark for oauth credentials and keeps other catalog models", () => {
+    const oauth = JSON.stringify({
+      type: "oauth",
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: Date.now() + 60_000,
+    });
+    expect(validateModelAuthAvailability("openai-codex", "gpt-5.3-codex-spark", oauth)).toMatch(
+      /not available with your current sign-in/i,
+    );
+    expect(validateModelAuthAvailability("openai-codex", "gpt-6-luna", oauth)).toBeUndefined();
+    expect(
+      validateModelAuthAvailability("openai-codex", "gpt-5.3-codex-spark", "sk-test-api-key"),
+    ).toBeUndefined();
   });
 });
 

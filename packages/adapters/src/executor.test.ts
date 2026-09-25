@@ -1577,6 +1577,50 @@ description: Prepare standup notes
     ).rejects.toThrow("Unknown model for that provider");
   });
 
+  it("rejects a saved Codex Spark model for ChatGPT subscription sign-in", async () => {
+    const provider = "openai-codex";
+    const modelId = "gpt-5.3-codex-spark";
+    const plaintext = JSON.stringify({
+      type: "oauth",
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: Date.now() + 60_000,
+    });
+    const prisma = {
+      bot: {
+        findFirst: vi.fn(async () => ({
+          modelProvider: provider,
+          modelId,
+          thinkingLevel: null,
+        })),
+      },
+      spaceModelPreference: {
+        findFirst: vi.fn(async () =>
+          modelPreference({
+            provider,
+            secretId: "secret-codex",
+            modelId,
+            isDefault: true,
+          }),
+        ),
+      },
+      userModelCredential: { findFirst: vi.fn(async () => null) },
+      deploymentSettings: { findUnique: vi.fn(async () => null) },
+      secret: {
+        findFirst: vi.fn(async () => ({ id: "secret-codex", ciphertext: plaintext })),
+        findUnique: vi.fn(async () => null),
+      },
+    } as unknown as PrismaClient;
+    const executor = createRunExecutor({
+      prisma,
+      secretStore: { load: vi.fn(() => plaintext), put: vi.fn() },
+    } as unknown as Parameters<typeof createRunExecutor>[0]);
+
+    await expect(
+      executor.resolveModel({ userId: "user-1", spaceId: "ws-1", botId: "bot-1" }),
+    ).rejects.toThrow(/not available with your current sign-in/i);
+  });
+
   it("applies a built-in connection output-token limit", async () => {
     const provider = "scripted";
     const plaintext = serializeModelSecret({

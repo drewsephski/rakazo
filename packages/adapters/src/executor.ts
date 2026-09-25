@@ -229,7 +229,9 @@ import { selectMemoryTools } from "./memory-tools.js";
 import {
   isCatalogModelChoice,
   selectConfiguredModel,
+  UnavailableModelForAuthError,
   validateConnectedModelChoice,
+  validateModelAuthAvailability,
 } from "./model-selection.js";
 import {
   filterImageReturningComputerTools,
@@ -1429,7 +1431,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const { credential, thinkingLevel } = selected;
         const runModelProvider = selected.provider ?? runtimeFallback?.provider;
         const runModelId = selected.id ?? runtimeFallback?.id;
-        if (!runModelProvider || !runModelId) {
+        const failRunBeforeModel = async (message: string) => {
           const failed = await deps.events.finalizeRun({
             spaceId: run.spaceId,
             threadId: thread.id,
@@ -1440,7 +1442,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             leaseOwner: workerId,
             leaseFence: fence,
             outcome: "failed",
-            error: MISSING_MODEL_MESSAGE,
+            error: message,
           });
           if (!failed) return;
           if (failed.continuationRunId) {
@@ -1453,7 +1455,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               deps,
               { ...run, sourceMessageId: run.sourceMessageId },
               { id: bot.id, name: bot.name },
-              `Could not complete the delegated request: ${MISSING_MODEL_MESSAGE}`,
+              `Could not complete the delegated request: ${message}`,
               "status",
             ).catch((error) => getLogger().error("bot message failure return", error));
           }
@@ -1461,22 +1463,34 @@ export function createRunExecutor(deps: ExecutorDeps) {
             await notifyRun(deps, run, {
               kind: "failure",
               title: `${bot.name} failed`,
-              body: MISSING_MODEL_MESSAGE,
+              body: message,
               botId: bot.id,
               threadId: thread.id,
             });
           }
+        };
+        if (!runModelProvider || !runModelId) {
+          await failRunBeforeModel(MISSING_MODEL_MESSAGE);
           return;
         }
-        const resolved = await resolveModelKey(
-          deps,
-          run.userId,
-          run.spaceId,
-          credential,
-          runModelProvider,
-          runModelId,
-          (values) => runSecrets.push(...values),
-        );
+        // An incompatible saved model is a configuration error. Record it on the run.
+        // Leaving it for the setup catch would retry and replace the message.
+        let resolved: Awaited<ReturnType<typeof resolveModelKey>>;
+        try {
+          resolved = await resolveModelKey(
+            deps,
+            run.userId,
+            run.spaceId,
+            credential,
+            runModelProvider,
+            runModelId,
+            (values) => runSecrets.push(...values),
+          );
+        } catch (error) {
+          if (!(error instanceof UnavailableModelForAuthError)) throw error;
+          await failRunBeforeModel(error.message);
+          return;
+        }
         runSecrets.push(...resolved.redact);
         await deps.prisma.run.updateMany({
           where: { id: runId, status: "running", leaseOwner: workerId, leaseFence: fence },
@@ -5088,6 +5102,8 @@ async function resolveModelKey(
       });
       if (!row) return { apiKey: deploymentKeyFor(deps, provider), redact: [] };
       const plaintext = deps.secretStore.load(row.ciphertext, row.id);
+      const authError = validateModelAuthAvailability(provider, modelId, plaintext);
+      if (authError) throw new UnavailableModelForAuthError(authError);
       registerSecrets?.(secretValuesToRedact(parseModelSecret(plaintext)));
       const persist = async (next: string) => {
         const stored = await deps.secretStore.put(
