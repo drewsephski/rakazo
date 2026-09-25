@@ -1,6 +1,8 @@
 import type { RealtimeFanout } from "@rakazo/adapter-kit";
 import {
   type BotSecretDestination,
+  encodeLoginSecret,
+  LoginSecretValue,
   type MessageBlock,
   MessageBlock as MessageBlockSchema,
   type ProductEvent,
@@ -186,6 +188,8 @@ export interface AnswerRunInput {
   messageId: string;
   answeredByUserId: string;
   answer: string;
+  /** Only for a login card; `answer` carries its password. */
+  username?: string;
 }
 
 export interface SendUserMessageInput {
@@ -575,6 +579,13 @@ async function commitAnswerRunInput(
   const selectedChoice = choiceAsk ? resolveAskChoice(input.answer, pendingAsk.actions) : undefined;
   if (secretAsk && !runSecretWriter) return null;
   if (secretAsk && pendingAsk.credential && run.userId !== input.answeredByUserId) return null;
+  const loginAsk = secretAsk && pendingAsk.credential?.auth.type === "login";
+  // A username belongs only to a login card, which cannot be saved without one.
+  if (loginAsk !== Boolean(input.username?.trim())) return null;
+  const login = loginAsk
+    ? LoginSecretValue.safeParse({ username: input.username!.trim(), password: input.answer })
+    : undefined;
+  if (login && !login.success) return null;
   let approvalEffect: { id: string; kind: string } | null = null;
   let approvalUserId: string | null = null;
 
@@ -645,7 +656,7 @@ async function commitAnswerRunInput(
       runId: input.runId,
       userId: run.userId,
       spaceId: input.spaceId,
-      plaintext: input.answer,
+      plaintext: login?.success ? encodeLoginSecret(login.data) : input.answer,
       tx,
     });
     await tx.externalEffect.updateMany({

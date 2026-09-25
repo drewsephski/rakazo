@@ -370,6 +370,7 @@ app.post("/computers/:id/browser", async (c) => {
                 kind: z.enum(["fill", "type"]),
                 ref: z.string().min(1).max(200),
                 text: z.string().max(32_000),
+                origin: z.string().url().max(2048).optional(),
               }),
             ]),
           )
@@ -378,6 +379,8 @@ app.post("/computers/:id/browser", async (c) => {
       }),
     ])
     .parse(await c.req.json());
+  const carriesSavedLogin =
+    body.command === "act" && body.actions.some((step) => "origin" in step && step.origin);
   try {
     const { container, layout } = await managedScreen(
       c.req.param("id"),
@@ -388,16 +391,25 @@ app.post("/computers/:id/browser", async (c) => {
     );
     const result = await runContainerCommand(
       container,
-      ["/usr/local/bin/rakazo-page-browser", body.command, JSON.stringify(body)],
+      // Arguments go over stdin: origin-bound fills carry saved logins, and argv is readable by
+      // any process in the computer, including the bot's own shell. Other commands also keep the
+      // argv copy so a computer still on an older image keeps working until it is replaced.
+      [
+        "/usr/local/bin/rakazo-page-browser",
+        body.command,
+        ...(carriesSavedLogin ? [] : [JSON.stringify(body)]),
+      ],
       {
         env: [
           `DISPLAY=${layout.display}`,
           `RAKAZO_CDP_PORT=${layout.debugPort}`,
           "HOME=/home/rakazo",
           "RAKAZO_BROWSER_WATCH_STDIN=1",
+          "RAKAZO_BROWSER_ARGS_STDIN=1",
         ],
         timeoutMs: 25_000,
         signal,
+        stdin: `${JSON.stringify(body)}\n`,
       },
     );
     // A nonzero exit or malformed output cannot establish which mutations ran.
@@ -1289,8 +1301,16 @@ async function inspectSupervisorContainer() {
 async function runContainerCommand(
   container: Docker.Container,
   argv: string[],
-  options: { workingDir?: string; env?: string[]; timeoutMs?: number; signal?: AbortSignal } = {},
+  options: {
+    workingDir?: string;
+    env?: string[];
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    /** Written to stdin without closing it; requires `signal`, whose abort closes stdin. */
+    stdin?: string;
+  } = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
+  if (options.stdin !== undefined && !options.signal) throw new Error("stdin requires a signal");
   options.signal?.throwIfAborted();
   const timeoutMs = options.timeoutMs;
   const completionMarker = timeoutMs
@@ -1310,6 +1330,7 @@ async function runContainerCommand(
   });
   options.signal?.throwIfAborted();
   const stream = await exec.start({ hijack: true, stdin: Boolean(options.signal) });
+  if (options.stdin !== undefined) stream.write(options.stdin);
   const chunks: Buffer[] = [];
   let onAbort: (() => void) | undefined;
   try {

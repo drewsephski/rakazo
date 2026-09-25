@@ -30,11 +30,21 @@ import {
   serializeComposerPrompt,
   truncateSlashDescription,
   userVisibleMessages,
+  withLiveStreamingProgress,
 } from "@rakazo/core";
 import * as Clipboard from "expo-clipboard";
 import { useFocusEffect, useLocalSearchParams, useNavigation, useRouter } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   ActionSheetIOS,
   ActivityIndicator,
@@ -49,6 +59,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StyleSheet,
   Text,
   TextInput,
   type TextProps,
@@ -111,6 +122,10 @@ import {
   takePhoto,
 } from "../lib/pick-attachments";
 import { threadRefreshDelayMs } from "../lib/refresh";
+import {
+  getCachedResponseStreamingEnabled,
+  subscribeResponseStreaming,
+} from "../lib/response-streaming";
 import {
   type ThreadScrollAction,
   ThreadScrollBehavior,
@@ -291,6 +306,23 @@ function Thread() {
       ? { botId }
       : undefined;
   const [snap, setSnap] = useState<MobileSnapshot | null>(null);
+  const snapRef = useRef<MobileSnapshot | null>(null);
+  const streamResponses = useSyncExternalStore(
+    subscribeResponseStreaming,
+    getCachedResponseStreamingEnabled,
+    () => false,
+  );
+  const streamResponsesRef = useRef(streamResponses);
+  streamResponsesRef.current = streamResponses;
+
+  function commitSnap(next: MobileSnapshot | null) {
+    snapRef.current = next;
+    setSnap(withLiveStreamingProgress(next, streamResponsesRef.current));
+  }
+
+  useEffect(() => {
+    setSnap(withLiveStreamingProgress(snapRef.current, streamResponses));
+  }, [streamResponses]);
   const activeThreadId = useRef<string | undefined>(undefined);
   const [draft, setDraft] = useState("");
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -640,8 +672,10 @@ function Thread() {
         expandedHistoryThread.current = null;
         pinnedAroundRef.current = null;
         historyEpoch.current += 1;
-        setSnap((current) =>
-          current ? { ...current, messages: [], olderCursor: null, run: null } : current,
+        commitSnap(
+          snapRef.current
+            ? { ...snapRef.current, messages: [], olderCursor: null, run: null }
+            : snapRef.current,
         );
       })
       .catch((err: unknown) =>
@@ -740,8 +774,8 @@ function Thread() {
       })
     )
       return next;
-    setSnap((prev) =>
-      mergeMobileSnapshot(prev, next, expandedHistoryThread.current === next.threadId),
+    commitSnap(
+      mergeMobileSnapshot(snapRef.current, next, expandedHistoryThread.current === next.threadId),
     );
     return next;
   }
@@ -775,7 +809,7 @@ function Thread() {
         }
       : null;
     jumpScrollTarget.current = targetInPage ? target.messageId : null;
-    setSnap({
+    commitSnap({
       ...snap,
       messages: targetInPage ? [...page.messages] : snap.messages,
       olderCursor: targetInPage ? page.olderCursor : snap.olderCursor,
@@ -798,7 +832,7 @@ function Thread() {
         return;
       }
       expandedHistoryThread.current = page.threadId;
-      setSnap((prev) => prependMobileMessagePage(prev, page));
+      commitSnap(prependMobileMessagePage(snapRef.current, page));
     } catch (err) {
       loadingOlderContent.current = false;
       setError(err instanceof Error ? err.message : t("Could not load earlier messages"));
@@ -937,7 +971,7 @@ function Thread() {
                   pinnedAroundRef.current = null;
                   historyEpoch.current += 1;
                 }
-                setSnap((prev) => applyMobileThreadEvent(prev, event));
+                commitSnap(applyMobileThreadEvent(snapRef.current, event));
               }
               if (event.type === "bot.updated") {
                 void refreshMentionBots();
@@ -1233,7 +1267,7 @@ function Thread() {
   }
 
   const answerMessage = useCallback(
-    async (message: MobileMessage, answer: string) => {
+    async (message: MobileMessage, answer: string, username?: string) => {
       const targetBotId = botId;
       const targetGroupId = groupId;
       if ((!targetBotId && !targetGroupId) || !message.runId) return;
@@ -1242,6 +1276,7 @@ function Thread() {
         runId: message.runId,
         messageId: message.id,
         answer,
+        ...(username ? { username } : {}),
       });
       if (isCurrentTarget(targetBotId, targetGroupId)) await refresh();
     },
@@ -2325,7 +2360,7 @@ const MessageBubble = memo(function MessageBubble({
   members?: MobileSnapshot["members"];
   replyPreview?: MobileMessage;
   canAnswer: boolean;
-  onAnswer: (message: MobileMessage, answer: string) => Promise<void>;
+  onAnswer: (message: MobileMessage, answer: string, username?: string) => Promise<void>;
   onOpenBot: (botId: string, name: string) => void;
   onPreviewMarkdown: (target: MarkdownArtifactPreviewTarget) => void;
   actionProps: MessageActionProps;
@@ -2351,7 +2386,7 @@ const MessageBubble = memo(function MessageBubble({
           ask={ask}
           actionProps={actionProps}
           canAnswer={canAnswer}
-          onAnswer={(answer) => onAnswer(message, answer)}
+          onAnswer={(answer, username) => onAnswer(message, answer, username)}
         />
         {appConnectBlocks.map((block, index) => (
           <AppConnectCard
@@ -3016,18 +3051,22 @@ function AskBlock({
 }: {
   ask: Extract<MobileMessage["blocks"][number], { kind: "ask" }>;
   canAnswer: boolean;
-  onAnswer: (answer: string) => Promise<void>;
+  onAnswer: (answer: string, username?: string) => Promise<void>;
   actionProps: MessageActionProps;
 }) {
   const tokens = useMobileTokens();
   const { t } = useI18n();
   const [answer, setAnswer] = useState("");
+  const [username, setUsername] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const answered = ask.status === "answered";
   const secretInput = isSecretAskBlock(ask);
+  const loginInput = secretInput && ask.credential?.auth.type === "login";
+  const incomplete =
+    (secretInput ? answer.length === 0 : !answer.trim()) || (loginInput && !username.trim());
   const secretLabel =
-    ask.purpose === "password"
+    loginInput || ask.purpose === "password"
       ? t("Password")
       : ask.purpose === "api_key"
         ? t("API key")
@@ -3037,13 +3076,14 @@ function AskBlock({
 
   async function submit() {
     if (submitting) return;
-    if (secretInput ? answer.length === 0 : !answer.trim()) return;
+    if (incomplete) return;
     const submitValue = secretInput ? answer : answer.trim();
+    const submitUsername = loginInput ? username.trim() : undefined;
     setSubmitting(true);
     setError(null);
     if (secretInput) setAnswer("");
     try {
-      await onAnswer(submitValue);
+      await onAnswer(submitValue, submitUsername);
     } catch (cause) {
       setError(!secretInput && cause instanceof Error ? cause.message : t("Could not send answer"));
     } finally {
@@ -3084,6 +3124,23 @@ function AskBlock({
         </Text>
       ) : canAnswer ? (
         <>
+          {loginInput ? (
+            <TextInput
+              accessibilityLabel={t("Username")}
+              value={username}
+              onChangeText={setUsername}
+              placeholder={t("Username")}
+              placeholderTextColor={tokens.mutedForeground}
+              autoComplete="off"
+              autoCorrect={false}
+              autoCapitalize="none"
+              editable={!submitting}
+              style={[
+                askInputStyles.field,
+                { borderColor: tokens.border, color: tokens.foreground },
+              ]}
+            />
+          ) : null}
           <TextInput
             accessibilityLabel={secretInput ? secretLabel : t("Answer")}
             value={answer}
@@ -3096,26 +3153,18 @@ function AskBlock({
             autoCapitalize={secretInput ? "none" : "sentences"}
             editable={!submitting}
             onSubmitEditing={() => void submit()}
-            style={{
-              minHeight: 42,
-              borderRadius: 12,
-              borderWidth: 1,
-              borderColor: tokens.border,
-              color: tokens.foreground,
-              paddingHorizontal: 12,
-              paddingVertical: 9,
-            }}
+            style={[askInputStyles.field, { borderColor: tokens.border, color: tokens.foreground }]}
           />
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={submitLabel}
-            disabled={(secretInput ? answer.length === 0 : !answer.trim()) || submitting}
+            disabled={incomplete || submitting}
             onPress={() => void submit()}
             style={{
               alignSelf: "flex-end",
               borderRadius: 999,
               backgroundColor: tokens.foreground,
-              opacity: (secretInput ? answer.length === 0 : !answer.trim()) || submitting ? 0.5 : 1,
+              opacity: incomplete || submitting ? 0.5 : 1,
               paddingHorizontal: 16,
               paddingVertical: 9,
             }}
@@ -3134,3 +3183,13 @@ function AskBlock({
     </View>
   );
 }
+
+const askInputStyles = StyleSheet.create({
+  field: {
+    minHeight: 42,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+});

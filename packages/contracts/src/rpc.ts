@@ -335,6 +335,8 @@ export const appContract = {
           runId: Id,
           messageId: Id,
           answer: z.string().min(1),
+          /** Only for a login card; `answer` carries its password. */
+          username: z.string().min(1).max(512).optional(),
         }),
       )
       .output(z.object({ ok: z.literal(true) })),

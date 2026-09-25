@@ -24,6 +24,9 @@ export const BotSecretAuth = z.discriminatedUnion("type", [
       .max(200)
       .regex(/^[^:\r\n]+$/),
   }),
+  // A website sign-in. The username and password are both protected; the backend only types
+  // them into pages on the saved origin and never sends them as HTTP credentials.
+  z.object({ type: z.literal("login") }),
 ]);
 
 /** Hosts inside a deployment's own network (loopback, RFC1918, CGNAT, .local). */
@@ -79,18 +82,49 @@ function botSecretOriginSchema(allowPrivateHttpOrigin: boolean) {
 }
 
 export function botSecretDestinationSchema(options?: { allowPrivateHttpOrigin?: boolean }) {
-  return z.object({
-    name: BotSecretName,
-    origin: botSecretOriginSchema(options?.allowPrivateHttpOrigin === true),
-    auth: BotSecretAuth,
-  });
+  return z
+    .object({
+      name: BotSecretName,
+      origin: botSecretOriginSchema(options?.allowPrivateHttpOrigin === true),
+      auth: BotSecretAuth,
+    })
+    .superRefine((destination, ctx) => {
+      // Private-LAN plain HTTP is for API credentials only. A website login is typed into a page.
+      if (destination.auth.type !== "login") return;
+      try {
+        if (new URL(destination.origin).protocol === "https:") return;
+      } catch {
+        /* The origin schema already rejects unparseable values. */
+      }
+      ctx.addIssue({
+        code: "custom",
+        path: ["origin"],
+        message: "Website logins require an HTTPS origin",
+      });
+    });
 }
 export const BotSecretDestination = botSecretDestinationSchema();
 export type BotSecretDestination = z.infer<typeof BotSecretDestination>;
 
+export const LoginSecretValue = z.object({
+  username: z.string().min(1).max(512),
+  password: z.string().min(1).max(4096),
+});
+export type LoginSecretValue = z.infer<typeof LoginSecretValue>;
+
+export function encodeLoginSecret(value: LoginSecretValue): string {
+  return JSON.stringify(LoginSecretValue.parse(value));
+}
+
+export function decodeLoginSecret(plaintext: string): LoginSecretValue {
+  return LoginSecretValue.parse(JSON.parse(plaintext));
+}
+
+/** Written atomically with the protected value, distinct from action approval. */
 export function botSecretSubmissionSchema(options?: { allowPrivateHttpOrigin?: boolean }) {
   return z.object({ credentialSaved: botSecretDestinationSchema(options) });
 }
+export const BotSecretSubmission = botSecretSubmissionSchema();
 
 export const SecretHttpRequest = z
   .object({

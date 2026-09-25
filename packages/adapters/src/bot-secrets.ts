@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { BotSecretDestination } from "@rakazo/contracts";
 import {
   botSecretDestinationSchema,
+  decodeLoginSecret,
   isPrivateNetworkHost,
   SecretHttpRequest,
 } from "@rakazo/contracts";
@@ -20,6 +21,9 @@ function scopeFields({ userId, spaceId, botId }: BotSecretScope): BotSecretScope
 const metadata = { name: true, origin: true, auth: true } as const;
 
 function credentialHeader(destination: BotSecretDestination, plaintext: string) {
+  if (destination.auth.type === "login") {
+    throw new Error("Credential cannot be used with this authentication method");
+  }
   const name = destination.auth.type === "header" ? destination.auth.name : "Authorization";
   const value =
     destination.auth.type === "bearer"
@@ -77,7 +81,8 @@ export async function storeBotSecret(input: {
   const { tx, secretStore, scope, plaintext } = input;
   if (!plaintext || plaintext.length > 16_384) throw new Error("Invalid credential length");
   const destination = normalizeSecretDestination(input.destination);
-  credentialHeader(destination, plaintext);
+  if (destination.auth.type === "login") decodeLoginSecret(plaintext);
+  else credentialHeader(destination, plaintext);
   // Serialize credential updates and deletions for a bot, including concurrent first saves.
   await tx.$queryRaw`SELECT id FROM bots WHERE id = ${scope.botId} FOR UPDATE`;
   const existing = await tx.botSecret.findFirst({
@@ -143,6 +148,9 @@ export async function requestWithBotSecret(input: {
   });
   if (!row) return { error: "Credential is unavailable. Use request_secret to save it first." };
   const destination = normalizeSecretDestination(row);
+  if (destination.auth.type === "login") {
+    return { error: "Website logins can only be filled into their site with browser_act." };
+  }
   const url = new URL(request.url);
   if (url.origin !== destination.origin || url.username || url.password || url.hash) {
     return { error: "This credential cannot be sent to that destination." };
@@ -208,4 +216,56 @@ export async function requestWithBotSecret(input: {
     controller.abort();
     await withAbort(fetch.close(), AbortSignal.timeout(1000)).catch(() => undefined);
   }
+}
+
+export type LoginField = "username" | "password";
+const MIN_REDACTED_USERNAME = 6;
+
+/**
+ * Resolve one field of a saved website login for a page fill. The caller must pass `origin` to
+ * the page browser, which refuses to fill unless the page is still on that origin.
+ */
+export async function resolveLoginFill(input: {
+  prisma: PrismaClient;
+  secretStore: EncryptedSecretStore;
+  scope: BotSecretScope;
+  name: string;
+  field: LoginField;
+}): Promise<{ text: string; origin: string; redactions: string[] } | { error: string }> {
+  const row = await input.prisma.botSecret.findFirst({
+    where: { ...scopeFields(input.scope), name: input.name },
+  });
+  if (!row) return { error: "Login is unavailable. Use request_secret to save it first." };
+  // Checked on the stored origin itself, so the private-LAN HTTP allowance cannot widen a login.
+  let storedOrigin: URL;
+  try {
+    storedOrigin = new URL(row.origin);
+  } catch {
+    return { error: "Website logins can only be filled on an HTTPS origin." };
+  }
+  if (storedOrigin.protocol !== "https:") {
+    return { error: "Website logins can only be filled on an HTTPS origin." };
+  }
+  const destination = normalizeSecretDestination(row);
+  if (destination.auth.type !== "login") {
+    return { error: "This credential is not a website login." };
+  }
+  if (destination.origin !== storedOrigin.origin) {
+    return { error: "Website logins can only be filled on an HTTPS origin." };
+  }
+  const login = decodeLoginSecret(input.secretStore.load(row.ciphertext, row.id));
+  return {
+    text: login[input.field],
+    origin: destination.origin,
+    // Redaction is substring replacement, so a short username would mangle unrelated text.
+    redactions: [
+      ...new Set(
+        [login.password, encodeURIComponent(login.password)].concat(
+          login.username.length >= MIN_REDACTED_USERNAME
+            ? [login.username, encodeURIComponent(login.username)]
+            : [],
+        ),
+      ),
+    ],
+  };
 }

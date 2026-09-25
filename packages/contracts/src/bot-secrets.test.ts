@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   BotSecretDestination,
   botSecretDestinationSchema,
+  decodeLoginSecret,
+  encodeLoginSecret,
   isCloudMetadataHost,
   isPrivateNetworkHost,
   SecretHttpRequest,
@@ -95,6 +97,16 @@ describe("private HTTP credential origins", () => {
       false,
     );
   });
+  it("rejects a private HTTP origin for a website login even when the owner opts in", () => {
+    expect(
+      relaxed.safeParse({
+        ...destination,
+        origin: "http://192.168.2.10:8080",
+        auth: { type: "login" },
+      }).success,
+    ).toBe(false);
+    expect(relaxed.safeParse({ ...destination, auth: { type: "login" } }).success).toBe(true);
+  });
   it.each([
     "http://192.168.2.10:8080/upload",
     "http://192.168.2.10:8080?key=1",
@@ -122,5 +134,22 @@ describe("private HTTP credential origins", () => {
     ["example.test", false],
   ])("classifies private host %s", (host, expected) => {
     expect(isPrivateNetworkHost(host)).toBe(expected);
+  });
+});
+
+describe("login credentials", () => {
+  it("accepts a login destination and round-trips its value", () => {
+    expect(
+      BotSecretDestination.safeParse({ ...destination, auth: { type: "login" } }).success,
+    ).toBe(true);
+    const value = { username: "fake-user", password: "fake:password\nwith newline" };
+    expect(decodeLoginSecret(encodeLoginSecret(value))).toEqual(value);
+  });
+
+  it.each([
+    { username: "", password: "fake-password" },
+    { username: "fake-user", password: "" },
+  ])("rejects an incomplete login %j", (value) => {
+    expect(() => encodeLoginSecret(value)).toThrow();
   });
 });

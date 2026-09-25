@@ -158,6 +158,7 @@ export const DE_MESSAGES: Record<string, string> = {
   "This removes every message and stops current work. The bot, computer, memory, and routines are kept.":
     "Das entfernt alle Nachrichten und stoppt die laufende Arbeit. Bot, Computer, Erinnerungen und Routinen bleiben erhalten.",
   "Type your answer": "Gib deine Antwort ein",
+  Username: "Benutzername",
   "Waiting for this bot’s response.": "Warten auf die Antwort dieses Bots.",
   "Work stopped, but the thread could not refresh: {detail}":
     "Arbeit gestoppt, aber der Thread konnte nicht aktualisiert werden: {detail}",
@@ -450,6 +451,7 @@ export const DE_MESSAGES: Record<string, string> = {
   Robot: "Roboter",
   "Scheduled tasks": "Geplante Aufgaben",
   "Sign out": "Abmelden",
+  "Stream replies": "Antworten streamen",
   System: "System",
   "This permanently deletes your account, bots, conversations, memories, files, and saved connections. This cannot be undone.":
     "Das löscht dein Konto, deine Bots, Unterhaltungen, Erinnerungen, Dateien und gespeicherten Verbindungen endgültig. Das lässt sich nicht rückgängig machen.",

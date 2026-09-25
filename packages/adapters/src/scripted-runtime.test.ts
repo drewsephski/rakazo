@@ -81,6 +81,30 @@ describe("inferScript request_secret", () => {
   });
 });
 
+describe("inferScript login request_secret", () => {
+  it("opens a login card via request_secret", () => {
+    expect(inferScript("show a login card")).toEqual([
+      {
+        assistant: "i need that sign-in in a protected card.",
+        toolCalls: [
+          {
+            name: "request_secret",
+            args: {
+              label: "Example sign-in",
+              purpose: "password",
+              credential: {
+                name: "example_login",
+                origin: "https://login.example.test",
+                auth: { type: "login" },
+              },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+});
+
 describe("inferScript write_file", () => {
   it("posts the reply after the tool so a routine run still has a durable final", () => {
     expect(

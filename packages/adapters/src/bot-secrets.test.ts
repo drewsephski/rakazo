@@ -1,7 +1,12 @@
 import type { BotSecretDestination } from "@rakazo/contracts";
+import { encodeLoginSecret } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { normalizeSecretDestination, requestWithBotSecret } from "./bot-secrets.js";
+import {
+  normalizeSecretDestination,
+  requestWithBotSecret,
+  resolveLoginFill,
+} from "./bot-secrets.js";
 import { EncryptedSecretStore } from "./secrets.js";
 
 afterEach(() => {
@@ -273,5 +278,95 @@ describe("normalizeSecretDestination", () => {
     expect(() =>
       normalizeSecretDestination({ ...lanDestination, origin: "http://api.example.test" }),
     ).toThrow();
+  });
+});
+
+describe("saved website logins", () => {
+  const login = {
+    name: "site_login",
+    origin: "https://login.example.test",
+    auth: { type: "login" },
+  };
+  async function loginFixture(username: string, auth: object = login.auth, origin = login.origin) {
+    const plaintext = encodeLoginSecret({ username, password: "fake-password-1" });
+    const encrypted = await secretStore.put(
+      plaintext,
+      { ...scope, operationId: "test", traceId: "test", signal: new AbortController().signal },
+      "login-1",
+    );
+    const row = { ...scope, ...login, origin, auth, ...encrypted };
+    const findFirst = vi.fn(async ({ where }) =>
+      Object.entries(where).every(([key, value]) => row[key as keyof typeof row] === value)
+        ? row
+        : null,
+    );
+    return { prisma: { botSecret: { findFirst } } as unknown as PrismaClient };
+  }
+
+  it("resolves one field bound to the saved origin with its redactions", async () => {
+    const { prisma } = await loginFixture("fake-user@example.test");
+    const input = { prisma, secretStore, scope, name: "site_login" };
+    expect(await resolveLoginFill({ ...input, field: "password" })).toEqual({
+      text: "fake-password-1",
+      origin: "https://login.example.test",
+      redactions: expect.arrayContaining(["fake-password-1", "fake-user@example.test"]),
+    });
+    expect(await resolveLoginFill({ ...input, field: "username" })).toMatchObject({
+      text: "fake-user@example.test",
+    });
+  });
+
+  it("does not redact a short username that would mangle unrelated text", async () => {
+    const { prisma } = await loginFixture("ada");
+    const resolved = await resolveLoginFill({
+      prisma,
+      secretStore,
+      scope,
+      name: "site_login",
+      field: "username",
+    });
+    expect(resolved).toMatchObject({ text: "ada" });
+    expect("redactions" in resolved && resolved.redactions).not.toContain("ada");
+  });
+
+  it("is never sent as an HTTP credential", async () => {
+    const { prisma } = await loginFixture("fake-user@example.test");
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    expect(
+      await requestWithBotSecret({
+        prisma,
+        secretStore,
+        scope,
+        request: { name: "site_login", url: `${login.origin}/api` },
+        signal: new AbortController().signal,
+        remote: { fetch, resolveHostname: publicResolver },
+      }),
+    ).toEqual({ error: expect.stringContaining("browser_act") });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses to fill a login saved on plain HTTP, including a private LAN origin", async () => {
+    vi.stubEnv("RAKAZO_SECRETS_ALLOW_PRIVATE_HTTP", "1");
+    const { prisma } = await loginFixture(
+      "fake-user@example.test",
+      login.auth,
+      "http://192.168.2.10:8080",
+    );
+    expect(
+      await resolveLoginFill({
+        prisma,
+        secretStore,
+        scope,
+        name: "site_login",
+        field: "password",
+      }),
+    ).toEqual({ error: "Website logins can only be filled on an HTTPS origin." });
+  });
+
+  it("refuses to fill a credential that is not a login", async () => {
+    const { input } = await fixture();
+    expect(await resolveLoginFill({ ...input, name: destination.name, field: "password" })).toEqual(
+      { error: "This credential is not a website login." },
+    );
   });
 });
