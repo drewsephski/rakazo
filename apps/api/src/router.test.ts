@@ -1494,6 +1494,95 @@ describe("model set default auth", () => {
       data: { isDefault: false },
     });
   });
+
+  it("keeps the working space credential when the other Codex secret cannot be read", async () => {
+    const older = new Date("2026-01-01T00:00:00.000Z");
+    const newer = new Date("2026-02-01T00:00:00.000Z");
+    const apiCredential = {
+      id: "cred-api",
+      userId: actor.userId,
+      provider: "openai-codex",
+      label: "API key",
+      secretId: "secret-api",
+      createdAt: older,
+      updatedAt: older,
+    };
+    const oauthCredential = {
+      id: "cred-oauth",
+      userId: actor.userId,
+      provider: "openai-codex",
+      label: "ChatGPT",
+      secretId: "secret-oauth",
+      createdAt: newer,
+      updatedAt: newer,
+    };
+    const upsert = vi.fn(async () => ({ id: "pref-luna" }));
+    const tx = {
+      userModelCredential: {
+        findMany: vi.fn().mockResolvedValue([oauthCredential, apiCredential]),
+      },
+      spaceModelPreference: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: "pref-spark",
+            modelId: spark,
+            isDefault: true,
+            updatedAt: older,
+            credential: apiCredential,
+          },
+        ]),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+        upsert,
+      },
+      secret: {
+        findFirst: vi.fn(async (args: { where: { id?: string } }) => {
+          if (args.where.id === "secret-api") return { id: "secret-api", ciphertext: "cipher-api" };
+          if (args.where.id === "secret-oauth") {
+            return { id: "secret-oauth", ciphertext: "cipher-oauth" };
+          }
+          return null;
+        }),
+      },
+    };
+    const load = vi.fn((ciphertext: string) => {
+      if (ciphertext === "cipher-oauth") throw new Error("unreadable");
+      return apiKey;
+    });
+    const handler = new RPCHandler(
+      createRouter({
+        prisma: {
+          $transaction: vi.fn(async (fn: (client: typeof tx) => unknown) => fn(tx)),
+        },
+        secrets: { load },
+        env: {
+          defaultProvider: "fake",
+          defaultModel: "fake-model",
+          webOrigin: "http://127.0.0.1:5173",
+          screenProxySecret: "fake-test-secret",
+          sandboxProvider: "fake",
+        },
+      } as unknown as RouterDeps),
+    );
+
+    const response = await call(handler, "models/setDefault", {
+      provider: "openai-codex",
+      modelId: luna,
+    });
+
+    expect(response.status).toBe(200);
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          spaceId_userId_credentialId: {
+            spaceId: actor.spaceId,
+            userId: actor.userId,
+            credentialId: "cred-api",
+          },
+        },
+        update: { modelId: luna, isDefault: true },
+      }),
+    );
+  });
 });
 
 describe("bot model auth on save", () => {

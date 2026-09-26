@@ -172,8 +172,7 @@ function appendCredential<C extends OrderedCredential>(
 /**
  * Credentials to try when saving a space default, best first.
  * The preference that already owns the model is the only candidate.
- * Otherwise an account that does not replace a different saved model comes first,
- * and the provider fallback that owns one is last.
+ * Otherwise the space preference comes first, ahead of a newer unused account.
  */
 export function defaultModelCredentialCandidates<C extends OrderedCredential>(input: {
   provider: string;
@@ -199,6 +198,7 @@ export function defaultModelCredentialCandidates<C extends OrderedCredential>(in
     if (owners.length > 0) return owners;
   }
 
+  const spacePreference = preferences[0]?.credential;
   const preferenceByCredentialId = new Map(
     preferences.map((preference) => [preference.credential.id, preference]),
   );
@@ -207,30 +207,21 @@ export function defaultModelCredentialCandidates<C extends OrderedCredential>(in
     return owned !== null && owned !== requestedModelId;
   };
   const seen = new Set<string>();
-  const unbound: C[] = [];
-  const bound: C[] = [];
+  const open: C[] = [];
+  const replacing: C[] = [];
   const add = (credential: C) => {
-    appendCredential(replacesSavedModel(credential.id) ? bound : unbound, seen, credential);
+    if (spacePreference && credential.id === spacePreference.id) return;
+    appendCredential(replacesSavedModel(credential.id) ? replacing : open, seen, credential);
   };
   for (const preference of preferences) add(preference.credential);
   for (const credential of credentials) add(credential);
 
-  const choice = chooseModelCredential({
-    provider: input.provider,
-    modelId: input.modelId,
-    preferences,
-    credentials,
-  });
-  const fallback =
-    choice?.source === "preference" ? choice.preference.credential : choice?.credential;
-  if (!fallback) return unbound;
-  const fallbackIndex = bound.findIndex((credential) => credential.id === fallback.id);
-  const fallbackCredential = fallbackIndex >= 0 ? bound[fallbackIndex] : undefined;
-  if (fallbackCredential && fallbackIndex !== bound.length - 1) {
-    bound.splice(fallbackIndex, 1);
-    bound.push(fallbackCredential);
-  }
-  return [...unbound, ...bound];
+  const ordered: C[] = [];
+  const picked = new Set<string>();
+  if (spacePreference) appendCredential(ordered, picked, spacePreference);
+  for (const credential of open) appendCredential(ordered, picked, credential);
+  for (const credential of replacing) appendCredential(ordered, picked, credential);
+  return ordered;
 }
 
 function credentialFromChoice<

@@ -181,6 +181,66 @@ export function validateModelAuthAvailability(
   return undefined;
 }
 
+function modelAuthIsRestricted(provider: string, modelId: string): boolean {
+  const entry = listPiCatalog().find((item) => item.provider === provider && item.id === modelId);
+  if (!entry) return false;
+  return (["oauth", "api_key", "openai_compatible", "disconnected"] as const).some(
+    (kind) => !catalogModelAvailableForAuth(provider, modelId, kind, entry.auth),
+  );
+}
+
+/**
+ * Ready credential to save as the space default.
+ * The first ready credential in `orderedIds` wins, unless it already stores an
+ * auth-restricted model and another ready credential can take the new default.
+ */
+export function selectDefaultCredentialId(input: {
+  provider: string;
+  modelId: string;
+  orderedIds: readonly string[];
+  readyIds: readonly string[];
+  savedModelId: (credentialId: string) => string | null | undefined;
+}): string | undefined {
+  const ready = new Set(input.readyIds);
+  const preferred = input.orderedIds.find((id) => ready.has(id));
+  if (!preferred) return undefined;
+  const saved = usableModelId(input.savedModelId(preferred));
+  const requested = usableModelId(input.modelId);
+  if (!saved || saved === requested) return preferred;
+  const alternate = input.orderedIds.find((id) => id !== preferred && ready.has(id));
+  if (!alternate || !modelAuthIsRestricted(input.provider, saved)) return preferred;
+  return alternate;
+}
+
+export type StoredModelAuthRead =
+  | { status: "ready" }
+  | { status: "unreadable" }
+  | { status: "rejected"; message: string };
+
+/** Load a stored credential and check whether it can call this catalog model. */
+export async function readStoredModelAuth(
+  prisma: Pick<PrismaClient, "secret">,
+  secretStore: Pick<EncryptedSecretStore, "load">,
+  userId: string,
+  secretId: string,
+  provider: string,
+  modelId: string,
+): Promise<StoredModelAuthRead> {
+  const secret = await prisma.secret.findFirst({
+    where: { id: secretId, userId, spaceId: null },
+    select: { id: true, ciphertext: true },
+  });
+  if (!secret) return { status: "unreadable" };
+  let plaintext: string;
+  try {
+    plaintext = secretStore.load(secret.ciphertext, secret.id);
+  } catch {
+    return { status: "unreadable" };
+  }
+  const message = validateModelAuthAvailability(provider, modelId, plaintext);
+  return message ? { status: "rejected", message } : { status: "ready" };
+}
+
 /** Readable rejection when a stored credential cannot call this catalog model. */
 export async function validateStoredModelAuth(
   prisma: Pick<PrismaClient, "secret">,
@@ -190,21 +250,9 @@ export async function validateStoredModelAuth(
   provider: string,
   modelId: string,
 ): Promise<string | undefined> {
-  const secret = await prisma.secret.findFirst({
-    where: { id: secretId, userId, spaceId: null },
-    select: { id: true, ciphertext: true },
-  });
-  if (!secret) return undefined;
-  try {
-    return validateModelAuthAvailability(
-      provider,
-      modelId,
-      secretStore.load(secret.ciphertext, secret.id),
-    );
-  } catch {
-    // Unreadable credentials fail when the run loads them, not as an auth mismatch.
-    return undefined;
-  }
+  const auth = await readStoredModelAuth(prisma, secretStore, userId, secretId, provider, modelId);
+  // Unreadable credentials fail when the run loads them, not as an auth mismatch.
+  return auth.status === "rejected" ? auth.message : undefined;
 }
 
 export async function validateConnectedModelChoice(

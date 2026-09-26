@@ -4,7 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   defaultCatalogModelId,
   modelCredentialAuthKindsForSpace,
+  readStoredModelAuth,
   selectConfiguredModel,
+  selectDefaultCredentialId,
   validateConnectedModelChoice,
   validateModelAuthAvailability,
 } from "./model-selection.js";
@@ -408,6 +410,96 @@ describe("space catalog auth", () => {
 
     expect(auth.byModel["openai-codex"]?.[spark]).toBe("disconnected");
     expect(listsSpark(auth)).toBe(false);
+  });
+});
+
+describe("default credential selection", () => {
+  const spark = "gpt-5.3-codex-spark";
+  const luna = "gpt-6-luna";
+
+  it("keeps the space preference when another account is also ready", () => {
+    expect(
+      selectDefaultCredentialId({
+        provider: "openai-codex",
+        modelId: luna,
+        orderedIds: ["older", "newer"],
+        readyIds: ["older", "newer"],
+        savedModelId: (id) => (id === "older" ? "gpt-5.4" : null),
+      }),
+    ).toBe("older");
+  });
+
+  it("moves the default off an auth-restricted model when another credential can call it", () => {
+    expect(
+      selectDefaultCredentialId({
+        provider: "openai-codex",
+        modelId: luna,
+        orderedIds: ["api", "oauth"],
+        readyIds: ["api", "oauth"],
+        savedModelId: (id) => (id === "api" ? spark : null),
+      }),
+    ).toBe("oauth");
+  });
+
+  it("keeps the restricted binding when no other credential is ready", () => {
+    expect(
+      selectDefaultCredentialId({
+        provider: "openai-codex",
+        modelId: luna,
+        orderedIds: ["api", "oauth"],
+        readyIds: ["api"],
+        savedModelId: (id) => (id === "api" ? spark : null),
+      }),
+    ).toBe("api");
+  });
+});
+
+describe("stored model auth", () => {
+  const userId = "user-1";
+
+  it("rejects an unreadable secret and a model the credential cannot call", async () => {
+    const findFirst = vi.fn(async (args: { where: { id?: string } }) => {
+      if (args.where.id === "secret-broken") {
+        return { id: "secret-broken", ciphertext: "cipher-broken" };
+      }
+      if (args.where.id === "secret-oauth") {
+        return { id: "secret-oauth", ciphertext: "cipher-oauth" };
+      }
+      return null;
+    });
+    const prisma = { secret: { findFirst } } as unknown as PrismaClient;
+    const load = vi.fn((ciphertext: string) => {
+      if (ciphertext === "cipher-broken") throw new Error("unreadable");
+      return JSON.stringify({
+        type: "oauth",
+        access: "access-token",
+        refresh: "refresh-token",
+        expires: Date.now() + 60_000,
+      });
+    });
+
+    await expect(
+      readStoredModelAuth(prisma, { load }, userId, "secret-missing", "openai-codex", "gpt-6-luna"),
+    ).resolves.toEqual({ status: "unreadable" });
+    await expect(
+      readStoredModelAuth(prisma, { load }, userId, "secret-broken", "openai-codex", "gpt-6-luna"),
+    ).resolves.toEqual({ status: "unreadable" });
+    await expect(
+      readStoredModelAuth(
+        prisma,
+        { load },
+        userId,
+        "secret-oauth",
+        "openai-codex",
+        "gpt-5.3-codex-spark",
+      ),
+    ).resolves.toEqual({
+      status: "rejected",
+      message: expect.stringMatching(/not available with your current sign-in/i),
+    });
+    await expect(
+      readStoredModelAuth(prisma, { load }, userId, "secret-oauth", "openai-codex", "gpt-6-luna"),
+    ).resolves.toEqual({ status: "ready" });
   });
 });
 

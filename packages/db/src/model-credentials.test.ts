@@ -223,24 +223,24 @@ describe("chooseModelCredential", () => {
     });
   });
 
-  it("lists an open credential before a preference that owns a different model", () => {
-    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
-    const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
+  it("prefers the space preference over a newer unused credential", () => {
+    const older = credential("older", "2026-01-01T00:00:00.000Z");
+    const newer = credential("newer", "2026-02-01T00:00:00.000Z");
     const candidates = defaultModelCredentialCandidates({
       provider: "openai-codex",
       modelId: "gpt-6-luna",
       preferences: [
         {
-          id: "pref-spark",
-          modelId: "gpt-5.3-codex-spark",
+          id: "pref-older",
+          modelId: "gpt-5.4",
           isDefault: true,
-          updatedAt: new Date("2026-02-01T00:00:00.000Z"),
-          credential: apiKey,
+          updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+          credential: older,
         },
       ],
-      credentials: [apiKey, oauth],
+      credentials: [newer, older],
     });
-    expect(candidates.map((item) => item.id)).toEqual(["oauth", "api"]);
+    expect(candidates.map((item) => item.id)).toEqual(["older", "newer"]);
   });
 
   it("keeps the model owner as the only default candidate", () => {
@@ -270,7 +270,7 @@ describe("chooseModelCredential", () => {
     expect(candidates.map((item) => item.id)).toEqual(["api"]);
   });
 
-  it("tries another bound credential before the provider fallback", () => {
+  it("lists the space preference before a credential that owns another model", () => {
     const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
     const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
     const candidates = defaultModelCredentialCandidates({
@@ -294,7 +294,7 @@ describe("chooseModelCredential", () => {
       ],
       credentials: [apiKey, oauth],
     });
-    expect(candidates.map((item) => item.id)).toEqual(["oauth", "api"]);
+    expect(candidates.map((item) => item.id)).toEqual(["api", "oauth"]);
   });
 
   it("still offers the only credential when its preference owns a different model", () => {

@@ -68,6 +68,7 @@ import {
   probeOpenAiCompatibleModels,
   provisionComputer,
   queueComputerUpdate,
+  readStoredModelAuth,
   releaseComputerExecutionLease,
   replaceComputer,
   resolveAutoReviewChecker,
@@ -78,6 +79,7 @@ import {
   scheduleComputerSleep,
   screenLeaseIdForRun,
   scriptedCatalogEntry,
+  selectDefaultCredentialId,
   serializeModelSecret,
   takeoverLeaseMs,
   toComputerRef,
@@ -1030,9 +1032,14 @@ export function createRouter(deps: RouterDeps) {
                   message: `No model credential is connected for ${input.provider}.`,
                 });
               }
+              const savedModelId = new Map(
+                preferences.map((preference) => [preference.credential.id, preference.modelId]),
+              );
+              const readyIds: string[] = [];
               let authFailure: string | undefined;
+              let sawReadable = false;
               for (const candidate of candidates) {
-                const authError = await validateStoredModelAuth(
+                const auth = await readStoredModelAuth(
                   tx,
                   deps.secrets,
                   context.actor.userId,
@@ -1040,16 +1047,29 @@ export function createRouter(deps: RouterDeps) {
                   input.provider,
                   input.modelId,
                 );
-                if (authError) {
-                  authFailure ??= authError;
+                if (auth.status === "unreadable") continue;
+                sawReadable = true;
+                if (auth.status === "rejected") {
+                  authFailure ??= auth.message;
                   continue;
                 }
-                await selectSpaceModelPreference(tx, context.actor, candidate.id, input.modelId);
-                return;
+                readyIds.push(candidate.id);
               }
-              throw new ORPCError("BAD_REQUEST", {
-                message: authFailure ?? UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+              const chosenId = selectDefaultCredentialId({
+                provider: input.provider,
+                modelId: input.modelId,
+                orderedIds: candidates.map((candidate) => candidate.id),
+                readyIds,
+                savedModelId: (credentialId) => savedModelId.get(credentialId),
               });
+              const fallbackId = !sawReadable ? candidates[0]?.id : undefined;
+              const credentialId = chosenId ?? fallbackId;
+              if (!credentialId) {
+                throw new ORPCError("BAD_REQUEST", {
+                  message: authFailure ?? UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+                });
+              }
+              await selectSpaceModelPreference(tx, context.actor, credentialId, input.modelId);
             },
             { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
           ),
