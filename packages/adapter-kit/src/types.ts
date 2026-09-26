@@ -430,7 +430,16 @@ export type AgentRuntimeEvent =
       actions?: Array<{ id: string; label: string }>;
     }
   | { type: "takeover"; reason: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number; provider: string; model: string }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      /** Cache hits and writes folded into inputTokens, kept apart so cost views can split them. */
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      provider: string;
+      model: string;
+    }
   | { type: "checkpoint"; blob: string }
   | {
       type: "subagent";
@@ -507,6 +516,8 @@ export type BackgroundJob = {
     payload: BackgroundJobPayloads[Name];
     availableAt?: Date;
     replaceKey?: string;
+    /** Cap retried executions; omit to use the job queue's default. */
+    maxAttempts?: number;
   };
 }[BackgroundJobName];
 
@@ -730,7 +741,13 @@ export type BrowserActKind = "click" | "fill" | "type";
 
 export type BrowserActStep =
   | { kind: "click"; ref: string }
-  | { kind: "fill" | "type"; ref: string; text: string };
+  | {
+      kind: "fill" | "type";
+      ref: string;
+      text: string;
+      /** Refuse the step unless the page is on this origin when it is applied. */
+      origin?: string;
+    };
 
 export interface BrowserActRequest {
   actions: BrowserActStep[];

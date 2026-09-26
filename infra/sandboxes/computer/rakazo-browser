@@ -50,14 +50,57 @@ clear_crash_state() {
     "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
 }
 
-if [ -d "$ACTUAL_PROFILE" ] && [ ! -e "$ACTUAL_PROFILE/SingletonLock" ] && [ ! -L "$ACTUAL_PROFILE/SingletonLock" ]; then
+# Match one argument in NUL-separated argv or in Chromium's space-joined title.
+# The whole flag is the search string, so spaces and " --" inside a profile path stay intact.
+cmdline_text() {
+  tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null || true
+}
+has_arg() {
+  text=$(cmdline_text "$1")
+  if printf '%s\n' "$text" | grep -Fx -- "$2" >/dev/null; then return 0; fi
+  if printf ' %s ' "$text" | grep -F -- " $2 " >/dev/null; then return 0; fi
+  return 1
+}
+has_prefix() {
+  text=$(cmdline_text "$1")
+  if [ $# -ge 3 ]; then
+    case "$text" in
+      *"$3"*) text="${text%%"$3"*}${text#*"$3"}" ;;
+    esac
+  fi
+  if printf '%s\n' "$text" | grep -e "^$2" >/dev/null; then return 0; fi
+  if printf ' %s ' "$text" | grep -F -- " $2" >/dev/null; then return 0; fi
+  return 1
+}
+
+# A stale SingletonLock is not a live browser. Leaving exit_type=Crashed makes Chrome
+# drop session cookies (account sign-in) on the next start while persistent cookies remain.
+# kill -0 is not enough: the PID may have been reused by an unrelated process.
+profile_lock_is_live() {
+  profile="$1"
+  lock=$(readlink "$profile/SingletonLock" 2>/dev/null || true)
+  pid=${lock##*-}
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  has_arg "$pid" "--user-data-dir=$profile" || return 1
+  if has_prefix "$pid" "--type=" "--user-data-dir=$profile"; then
+    return 1
+  fi
+  return 0
+}
+
+if [ -d "$ACTUAL_PROFILE" ] && ! profile_lock_is_live "$ACTUAL_PROFILE"; then
+  rm -f "$ACTUAL_PROFILE/SingletonLock" "$ACTUAL_PROFILE/SingletonCookie" "$ACTUAL_PROFILE/SingletonSocket" 2>/dev/null || true
   find "$ACTUAL_PROFILE" \( -name Preferences -o -name 'Local State' \) -type f 2>/dev/null |
     while IFS= read -r f; do
       clear_crash_state "$f" 2>/dev/null || rm -f "${f}.tmp"
     done || true
 fi
 
-FLAGS="--test-type --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --password-store=basic --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=$DEBUG_PORT"
+FLAGS="--test-type --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --password-store=basic --restore-last-session --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=$DEBUG_PORT"
 if [ "$USER_DATA_DIR_SET" -eq 0 ]; then
   exec "$BIN" $FLAGS --user-data-dir="$PROFILE" "$@"
 fi

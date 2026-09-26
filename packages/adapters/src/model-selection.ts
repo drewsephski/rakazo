@@ -2,12 +2,21 @@ import type { AgentRunRequest } from "@rakazo/adapter-kit";
 import type { Actor } from "@rakazo/contracts";
 import { usableModelId } from "@rakazo/contracts";
 import {
+  chooseModelCredential,
   type findDefaultModelCredential,
   findModelCredential,
   type PrismaClient,
 } from "@rakazo/db";
+import type { ModelCredentialAuthKind } from "./pi-catalog-availability.js";
+import {
+  catalogModelAvailableForAuth,
+  listAvailablePiCatalog,
+  modelCredentialAuthKindFromPlaintext,
+  UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+} from "./pi-catalog-availability.js";
 import { listPiCatalog, scriptedCatalogEntry } from "./pi-models.js";
 import { OPENAI_COMPATIBLE_PROVIDER_ID } from "./pi-openai-compatible-provider.js";
+import type { EncryptedSecretStore } from "./secrets.js";
 
 type ModelCredential = Awaited<ReturnType<typeof findDefaultModelCredential>>;
 
@@ -17,8 +26,233 @@ export function isCatalogModelChoice(provider: string, modelId: string) {
   );
 }
 
-export function defaultCatalogModelId(provider: string): string | null {
-  return usableModelId(listPiCatalog().find((item) => item.provider === provider)?.id);
+export function defaultCatalogModelId(
+  provider: string,
+  credentialPlaintext?: string,
+): string | null {
+  const authKind = credentialPlaintext
+    ? modelCredentialAuthKindFromPlaintext(credentialPlaintext)
+    : "disconnected";
+  const authByProvider: Partial<Record<string, ModelCredentialAuthKind>> =
+    authKind === "disconnected" ? {} : { [provider]: authKind };
+  const entry = listAvailablePiCatalog(authByProvider).find((item) => item.provider === provider);
+  return usableModelId(entry?.id);
+}
+
+export class UnavailableModelForAuthError extends Error {
+  constructor(message = UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE) {
+    super(message);
+    this.name = "UnavailableModelForAuthError";
+  }
+}
+
+export type SpaceCatalogAuth = {
+  byProvider: Partial<Record<string, ModelCredentialAuthKind>>;
+  /** Model-specific kinds. `"disconnected"` blocks the provider fallback. */
+  byModel: Partial<
+    Record<string, Partial<Record<string, ModelCredentialAuthKind | "disconnected">>>
+  >;
+};
+
+/**
+ * Auth kinds for the credentials `chooseModelCredential` would select in this space.
+ * Each catalog model uses the preference that owns that model id, then the provider
+ * preference, then the newest account credential. An unreadable selected secret stays
+ * disconnected instead of falling through to an older key.
+ */
+export async function modelCredentialAuthKindsForSpace(
+  prisma: PrismaClient,
+  secretStore: Pick<EncryptedSecretStore, "load">,
+  scope: Pick<Actor, "userId" | "spaceId">,
+): Promise<SpaceCatalogAuth> {
+  const [credentials, preferences] = await Promise.all([
+    prisma.userModelCredential.findMany({
+      where: { userId: scope.userId },
+      select: {
+        id: true,
+        provider: true,
+        secretId: true,
+        updatedAt: true,
+        createdAt: true,
+      },
+    }),
+    prisma.spaceModelPreference.findMany({
+      where: { userId: scope.userId, spaceId: scope.spaceId },
+      select: {
+        id: true,
+        modelId: true,
+        isDefault: true,
+        updatedAt: true,
+        credential: {
+          select: {
+            id: true,
+            provider: true,
+            secretId: true,
+            updatedAt: true,
+            createdAt: true,
+          },
+        },
+      },
+    }),
+  ]);
+  const connectedProviders = new Set([
+    ...credentials.map((credential) => credential.provider),
+    ...preferences.map((preference) => preference.credential.provider),
+  ]);
+  const selections: Array<{
+    provider: string;
+    modelId: string;
+    secretId: string;
+    modelSpecific: boolean;
+  }> = [];
+  for (const entry of listPiCatalog()) {
+    if (!connectedProviders.has(entry.provider)) continue;
+    const choice = chooseModelCredential({
+      provider: entry.provider,
+      modelId: entry.id,
+      preferences,
+      credentials,
+    });
+    if (!choice) continue;
+    const secretId =
+      choice.source === "preference"
+        ? choice.preference.credential.secretId
+        : choice.credential.secretId;
+    const requestedModelId = usableModelId(entry.id);
+    selections.push({
+      provider: entry.provider,
+      modelId: entry.id,
+      secretId,
+      modelSpecific:
+        choice.source === "preference" &&
+        requestedModelId !== null &&
+        choice.preference.modelId === requestedModelId,
+    });
+  }
+  const empty: SpaceCatalogAuth = { byProvider: {}, byModel: {} };
+  if (selections.length === 0) return empty;
+
+  const secrets = await prisma.secret.findMany({
+    where: {
+      id: { in: [...new Set(selections.map((selection) => selection.secretId))] },
+      userId: scope.userId,
+      spaceId: null,
+    },
+    select: { id: true, ciphertext: true },
+  });
+  const ciphertextById = new Map(secrets.map((secret) => [secret.id, secret.ciphertext]));
+  const readKind = (secretId: string): ModelCredentialAuthKind | undefined => {
+    const ciphertext = ciphertextById.get(secretId);
+    if (!ciphertext) return undefined;
+    try {
+      return modelCredentialAuthKindFromPlaintext(secretStore.load(ciphertext, secretId));
+    } catch {
+      return undefined;
+    }
+  };
+
+  const auth: SpaceCatalogAuth = { byProvider: {}, byModel: {} };
+  for (const selection of selections) {
+    const kind = readKind(selection.secretId);
+    if (selection.modelSpecific) {
+      const models = auth.byModel[selection.provider] ?? {};
+      models[selection.modelId] = kind ?? "disconnected";
+      auth.byModel[selection.provider] = models;
+      continue;
+    }
+    if (kind) auth.byProvider[selection.provider] = kind;
+  }
+  return auth;
+}
+
+export function validateModelAuthAvailability(
+  provider: string,
+  modelId: string,
+  credentialPlaintext?: string,
+): string | undefined {
+  if (!credentialPlaintext) return undefined;
+  const authKind = modelCredentialAuthKindFromPlaintext(credentialPlaintext);
+  const catalogEntry = listPiCatalog().find(
+    (item) => item.provider === provider && item.id === modelId,
+  );
+  if (!catalogModelAvailableForAuth(provider, modelId, authKind, catalogEntry?.auth)) {
+    return UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE;
+  }
+  return undefined;
+}
+
+function modelAuthIsRestricted(provider: string, modelId: string): boolean {
+  const entry = listPiCatalog().find((item) => item.provider === provider && item.id === modelId);
+  if (!entry) return false;
+  return (["oauth", "api_key", "openai_compatible", "disconnected"] as const).some(
+    (kind) => !catalogModelAvailableForAuth(provider, modelId, kind, entry.auth),
+  );
+}
+
+/**
+ * Ready credential to save as the space default.
+ * The first ready credential in `orderedIds` wins, unless it already stores an
+ * auth-restricted model and another ready credential can take the new default.
+ */
+export function selectDefaultCredentialId(input: {
+  provider: string;
+  modelId: string;
+  orderedIds: readonly string[];
+  readyIds: readonly string[];
+  savedModelId: (credentialId: string) => string | null | undefined;
+}): string | undefined {
+  const ready = new Set(input.readyIds);
+  const preferred = input.orderedIds.find((id) => ready.has(id));
+  if (!preferred) return undefined;
+  const saved = usableModelId(input.savedModelId(preferred));
+  const requested = usableModelId(input.modelId);
+  if (!saved || saved === requested) return preferred;
+  const alternate = input.orderedIds.find((id) => id !== preferred && ready.has(id));
+  if (!alternate || !modelAuthIsRestricted(input.provider, saved)) return preferred;
+  return alternate;
+}
+
+export type StoredModelAuthRead =
+  | { status: "ready" }
+  | { status: "unreadable" }
+  | { status: "rejected"; message: string };
+
+/** Load a stored credential and check whether it can call this catalog model. */
+export async function readStoredModelAuth(
+  prisma: Pick<PrismaClient, "secret">,
+  secretStore: Pick<EncryptedSecretStore, "load">,
+  userId: string,
+  secretId: string,
+  provider: string,
+  modelId: string,
+): Promise<StoredModelAuthRead> {
+  const secret = await prisma.secret.findFirst({
+    where: { id: secretId, userId, spaceId: null },
+    select: { id: true, ciphertext: true },
+  });
+  if (!secret) return { status: "unreadable" };
+  let plaintext: string;
+  try {
+    plaintext = secretStore.load(secret.ciphertext, secret.id);
+  } catch {
+    return { status: "unreadable" };
+  }
+  const message = validateModelAuthAvailability(provider, modelId, plaintext);
+  return message ? { status: "rejected", message } : { status: "ready" };
+}
+
+/** Readable rejection when a stored credential cannot call this catalog model. */
+export async function validateStoredModelAuth(
+  prisma: Pick<PrismaClient, "secret">,
+  secretStore: Pick<EncryptedSecretStore, "load">,
+  userId: string,
+  secretId: string,
+  provider: string,
+  modelId: string,
+): Promise<string | undefined> {
+  const auth = await readStoredModelAuth(prisma, secretStore, userId, secretId, provider, modelId);
+  // Unreadable credentials fail when the run loads them, not as an auth mismatch.
+  return auth.status === "rejected" ? auth.message : undefined;
 }
 
 export async function validateConnectedModelChoice(

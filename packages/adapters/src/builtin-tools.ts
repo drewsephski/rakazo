@@ -1,11 +1,63 @@
 import type { ConnectorTool } from "@rakazo/adapter-kit";
 import {
-  BotSecretDestination,
   BotSecretName,
+  botSecretDestinationSchema,
   SecretAskPurpose,
   SecretHttpRequest,
 } from "@rakazo/contracts";
 import { z } from "zod";
+import { allowPrivateHttpSecretOrigins } from "./bot-secrets.js";
+
+// The owner flag can land in process.env after static imports run (loadRootEnv
+// parses .env once the entry module is already executing), so the model-facing
+// surface is built lazily on first tool access instead of at module scope.
+let secretAskSurface:
+  | {
+      description: string;
+      inputSchema: ConnectorTool["inputSchema"];
+    }
+  | undefined;
+function secretAskToolSurface() {
+  const allowPrivateHttpOrigins = allowPrivateHttpSecretOrigins();
+  secretAskSurface ??= {
+    description: `Collect a credential in a masked field. Supply credential to save a named API credential for this bot and user at one ${
+      allowPrivateHttpOrigins
+        ? "HTTPS origin, or an HTTP origin on a private LAN host"
+        : "HTTPS origin"
+    }, or connectionId for a one-use connector code. For a website login the user wants saved, use auth {type:"login"} with the sign-in page's HTTPS origin; the card asks for a username and password, and browser_act fill_secret types them. Existing named credentials are reused unless replace is true. For 2FA, CAPTCHA, passkeys, or anything else that needs the live desktop, call request_takeover instead.`,
+    inputSchema: {
+      oneOf: [
+        {
+          type: "object",
+          properties: {
+            label: { type: "string" },
+            purpose: { type: "string", enum: SecretAskPurpose.options },
+            credential: z.toJSONSchema(
+              botSecretDestinationSchema({ allowPrivateHttpOrigin: allowPrivateHttpOrigins }),
+            ),
+            replace: {
+              type: "boolean",
+              description: "Ask the user to replace an existing credential value.",
+            },
+          },
+          required: ["label", "purpose", "credential"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            label: { type: "string" },
+            purpose: { type: "string", enum: SecretAskPurpose.options },
+            connectionId: { type: "string" },
+          },
+          required: ["label", "purpose", "connectionId"],
+          additionalProperties: false,
+        },
+      ],
+    },
+  };
+  return secretAskSurface;
+}
 
 export const DELEGATION_TOOL_NAMES = new Set([
   "run_subagent",
@@ -15,6 +67,77 @@ export const DELEGATION_TOOL_NAMES = new Set([
   "handoff_to_bot",
   "message_bot",
 ]);
+
+const scheduleCreateProperties = {
+  name: { type: "string", description: "Short label shown in Routines." },
+  prompt: {
+    type: "string",
+    description:
+      "Concrete steps for when the schedule fires: name the connected plugin tools to call (e.g. GITHUB_LIST_RELEASES for owner/repo), what to extract, and how to report. Prefer plugin tools over computer browser or web search for app data.",
+  },
+  timezone: { type: "string", description: "IANA timezone (default UTC)." },
+};
+
+const scheduleTimingNames = [
+  "cron",
+  "every",
+  "unit",
+  "runAt",
+  "delayMinutes",
+  "delaySeconds",
+] as const;
+
+/**
+ * Model serializers often emit unused optional fields as null or "". Those are
+ * not a second timing method; a real value in another method still fails the branch.
+ */
+const blankScheduleTiming = {
+  anyOf: [{ type: "null" }, { type: "string", pattern: "^\\s*$" }],
+};
+
+const scheduleTimingSpecs = {
+  cron: { type: "string", description: "5-field cron for repeating schedules." },
+  every: { type: "number", description: "Repeat interval amount for repeating schedules." },
+  unit: {
+    type: "string",
+    enum: ["minutes", "hours", "days"],
+    description: "Unit for every (minimum 1 minute).",
+  },
+  runAt: { type: "string", description: "ISO datetime for a one-shot schedule." },
+  delayMinutes: {
+    type: "number",
+    description: "Minutes from now for a one-shot schedule.",
+  },
+  delaySeconds: {
+    type: "number",
+    description: "Seconds from now for a one-shot schedule (may be under one minute).",
+  },
+};
+
+function scheduleCreateBranch(active: readonly (keyof typeof scheduleTimingSpecs)[]) {
+  const activeNames = new Set<string>(active);
+  const properties: Record<string, unknown> = { ...scheduleCreateProperties };
+  for (const name of scheduleTimingNames) {
+    properties[name] = activeNames.has(name) ? scheduleTimingSpecs[name] : blankScheduleTiming;
+  }
+  return {
+    type: "object",
+    properties,
+    required: ["name", "prompt", ...active],
+    additionalProperties: false,
+  };
+}
+
+/** Exactly one timing method. Null or blank leftovers stay valid so callers can ignore them. */
+const scheduleCreateInputSchema = {
+  oneOf: [
+    scheduleCreateBranch(["cron"]),
+    scheduleCreateBranch(["every", "unit"]),
+    scheduleCreateBranch(["runAt"]),
+    scheduleCreateBranch(["delayMinutes"]),
+    scheduleCreateBranch(["delaySeconds"]),
+  ],
+};
 
 export const builtinAgentTools: ConnectorTool[] = [
   {
@@ -82,7 +205,7 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "browser_act",
     description:
-      'Click or fill page elements by ref from browser_snapshot (kinds: click, fill, type). Prefer this over computer_act for web pages. If the result includes fallback:"computer_act", use computer_act instead.',
+      'Click or fill page elements by ref from browser_snapshot (kinds: click, fill, type, fill_secret). fill_secret types the username or password of a login saved with request_secret, only on the site it was saved for; you never see the value. Prefer this over computer_act for web pages. If the result includes fallback:"computer_act", use computer_act instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -91,9 +214,15 @@ export const builtinAgentTools: ConnectorTool[] = [
           items: {
             type: "object",
             properties: {
-              kind: { type: "string", enum: ["click", "fill", "type"] },
+              kind: { type: "string", enum: ["click", "fill", "type", "fill_secret"] },
               ref: { type: "string", description: "Element ref from browser_snapshot." },
               text: { type: "string", description: "Text for fill or type." },
+              secret: { type: "string", description: "Saved login name for fill_secret." },
+              field: {
+                type: "string",
+                enum: ["username", "password"],
+                description: "Login field for fill_secret.",
+              },
             },
             required: ["kind", "ref"],
           },
@@ -137,10 +266,14 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "attach_file",
     description:
-      "Attach a workspace file from this bot's home to the chat thread as an image or common file. The file stays in place; users can open it from the message.",
+      "Attach a workspace file from this bot's home to the chat thread as an image or common file. The file stays in place; users can open it from the message and from the Artifacts tab. For a self-contained HTML page, document, or anything else meant to be opened and viewed on its own (not just downloaded) — give it name and description: a short human-readable title and a one-line summary of what it is. Skip them for an ordinary attachment like a log file or export. To UPDATE something you already made, call this again with the exact same name — it becomes a new version of that same artifact (visible in a version switcher) instead of a separate one; a different name always starts a new artifact.",
     inputSchema: {
       type: "object",
-      properties: { path: { type: "string" } },
+      properties: {
+        path: { type: "string" },
+        name: { type: "string" },
+        description: { type: "string" },
+      },
       required: ["path"],
     },
   },
@@ -228,37 +361,13 @@ export const builtinAgentTools: ConnectorTool[] = [
   },
   {
     name: "request_secret",
-    description:
-      "Collect a credential in a masked field. Supply credential to save a named API credential for this bot and user at one HTTPS origin, or connectionId for a one-use connector code. Existing named credentials are reused unless replace is true. For website logins, CAPTCHA, passkeys, or anything that needs the live desktop, call request_takeover instead.",
+    get description() {
+      return secretAskToolSurface().description;
+    },
     // Exactly one destination: credential XOR connectionId. Sibling optionals
     // looked schema-valid to models but the executor rejects both and neither.
-    inputSchema: {
-      oneOf: [
-        {
-          type: "object",
-          properties: {
-            label: { type: "string" },
-            purpose: { type: "string", enum: SecretAskPurpose.options },
-            credential: z.toJSONSchema(BotSecretDestination),
-            replace: {
-              type: "boolean",
-              description: "Ask the user to replace an existing credential value.",
-            },
-          },
-          required: ["label", "purpose", "credential"],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          properties: {
-            label: { type: "string" },
-            purpose: { type: "string", enum: SecretAskPurpose.options },
-            connectionId: { type: "string" },
-          },
-          required: ["label", "purpose", "connectionId"],
-          additionalProperties: false,
-        },
-      ],
+    get inputSchema() {
+      return secretAskToolSurface().inputSchema;
     },
   },
   {
@@ -524,6 +633,13 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "task_catalog",
+    description:
+      "Read-only inventory and source of truth for this bot's real open tasks, saved routines, taught skills, reusable skills, and currently exposed tools. Call it before claiming a task or skill exists. Use the returned ids and exact names; do not infer capabilities from memory or conversation text.",
+    inputSchema: { type: "object", properties: {} },
+    readOnly: true,
+  },
+  {
     name: "scratchpad_list",
     description:
       "List this bot's scratchpad / open-work items (todos and parked work). By default omits completed items.",
@@ -595,38 +711,7 @@ export const builtinAgentTools: ConnectorTool[] = [
     name: "schedule_create",
     description:
       'Create a reminder or recurring job for this bot. Use for "remind me in 10 minutes" or "every morning send a joke". Repeats: cron or every/unit (min 1 minute). One-shot: runAt, delayMinutes, or delaySeconds.',
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Short label shown in Routines." },
-        prompt: {
-          type: "string",
-          description:
-            "Concrete steps for when the schedule fires: name the connected plugin tools to call (e.g. GITHUB_LIST_RELEASES for owner/repo), what to extract, and how to report. Prefer plugin tools over computer browser or web search for app data.",
-        },
-        cron: { type: "string", description: "5-field cron for repeating schedules." },
-        every: { type: "number", description: "Repeat interval amount for repeating schedules." },
-        unit: {
-          type: "string",
-          enum: ["minutes", "hours", "days"],
-          description: "Unit for every (minimum 1 minute).",
-        },
-        runAt: {
-          type: "string",
-          description: "ISO datetime for a one-shot schedule.",
-        },
-        delayMinutes: {
-          type: "number",
-          description: "Minutes from now for a one-shot schedule.",
-        },
-        delaySeconds: {
-          type: "number",
-          description: "Seconds from now for a one-shot schedule (may be under one minute).",
-        },
-        timezone: { type: "string", description: "IANA timezone (default UTC)." },
-      },
-      required: ["name", "prompt"],
-    },
+    inputSchema: scheduleCreateInputSchema,
   },
   {
     name: "schedule_list",

@@ -646,11 +646,14 @@ export async function sendThreadMessage(
           replyQuote,
           clientNonce: input.clientNonce,
         });
+        // The creation intro has no tools. A message sent while it is still
+        // active must start its own run, not steer into that turn.
         const activeRuns = await tx.run.findMany({
           where: {
             threadId: target.threadId,
             botId: target.botId,
             status: { in: [...ACTIVE_RUN_STATUSES] },
+            trigger: { not: "created" },
           },
           select: { id: true, taskId: true, status: true },
         });

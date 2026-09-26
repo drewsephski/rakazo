@@ -4,6 +4,7 @@ import {
   billedPromptTokens,
   clipToolResultContent,
   clipToolResultText,
+  REASONING_MODEL_MAX_TOKENS,
   resolveCompletionMaxTokens,
   TOOL_RESULT_TEXT_LIMIT,
 } from "./pi-runtime-limits.js";
@@ -17,13 +18,20 @@ describe("billedPromptTokens", () => {
         cacheRead: 8_000,
         cacheWrite: 200,
       }),
-    ).toEqual({ inputTokens: 8_212, outputTokens: 40 });
+    ).toEqual({
+      inputTokens: 8_212,
+      outputTokens: 40,
+      cacheReadTokens: 8_000,
+      cacheWriteTokens: 200,
+    });
   });
 
   it("keeps uncached-only usage unchanged when cache fields are absent", () => {
     expect(billedPromptTokens({ input: 100, output: 20 })).toEqual({
       inputTokens: 100,
       outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
     });
   });
 
@@ -35,7 +43,30 @@ describe("billedPromptTokens", () => {
         cacheRead: 12_500,
         cacheWrite: 0,
       }),
-    ).toEqual({ inputTokens: 12_500, outputTokens: 15 });
+    ).toEqual({
+      inputTokens: 12_500,
+      outputTokens: 15,
+      cacheReadTokens: 12_500,
+      cacheWriteTokens: 0,
+    });
+  });
+
+  it("reports the cache halves alongside the billed total", () => {
+    expect(billedPromptTokens({ input: 100, cacheRead: 40, cacheWrite: 10, output: 5 })).toEqual({
+      inputTokens: 150,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 10,
+      outputTokens: 5,
+    });
+  });
+
+  it("floors missing or negative cache counts at zero", () => {
+    expect(billedPromptTokens({ input: 100, cacheRead: -40, output: 5 })).toEqual({
+      inputTokens: 100,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 5,
+    });
   });
 });
 
@@ -52,6 +83,21 @@ describe("resolveCompletionMaxTokens", () => {
   it("clamps an agent-supplied options maxTokens to the user cap", () => {
     expect(resolveCompletionMaxTokens(128_000, undefined, 128_000)).toBe(DEFAULT_MODEL_MAX_TOKENS);
     expect(resolveCompletionMaxTokens(128_000, 16_384, 128_000)).toBe(16_384);
+  });
+
+  it("gives a reasoning model room for thinking and a reply", () => {
+    expect(resolveCompletionMaxTokens(128_000, undefined, undefined, true)).toBe(
+      REASONING_MODEL_MAX_TOKENS,
+    );
+    // A smaller model ceiling still wins.
+    expect(resolveCompletionMaxTokens(8_192, undefined, undefined, true)).toBe(8_192);
+  });
+
+  it("keeps the configured cap and the non-reasoning default intact", () => {
+    expect(resolveCompletionMaxTokens(128_000, 8_192, undefined, true)).toBe(8_192);
+    expect(resolveCompletionMaxTokens(128_000, undefined, undefined, false)).toBe(
+      DEFAULT_MODEL_MAX_TOKENS,
+    );
   });
 });
 

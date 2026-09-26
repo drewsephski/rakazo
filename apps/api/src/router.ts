@@ -32,6 +32,7 @@ import {
   acquireComputerExecutionLease,
   applyTeachingDesktopInput,
   archiveBot,
+  assertSafeRemoteUrl,
   buildMcpCredentialBlob,
   buildModelConnectPlaintext,
   ComputerBusyError,
@@ -53,10 +54,12 @@ import {
   isComputerScreenUnavailable,
   isSandboxGoneError,
   isScratchpadStatus,
+  listAvailablePiCatalog,
   listPiCatalog,
   listScratchpadItems,
   McpOAuthBroker,
   mapScratchpadItem,
+  modelCredentialAuthKindsForSpace,
   modelCredentialDto,
   pickReusableConnection,
   planLiveConnectionSync,
@@ -65,6 +68,7 @@ import {
   probeOpenAiCompatibleModels,
   provisionComputer,
   queueComputerUpdate,
+  readStoredModelAuth,
   releaseComputerExecutionLease,
   replaceComputer,
   resolveAutoReviewChecker,
@@ -75,14 +79,18 @@ import {
   scheduleComputerSleep,
   screenLeaseIdForRun,
   scriptedCatalogEntry,
+  selectDefaultCredentialId,
   serializeModelSecret,
   takeoverLeaseMs,
   toComputerRef,
   touchRunningComputer,
+  UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+  validateModelAuthAvailability,
+  validateStoredModelAuth,
   verifyMcpInstall,
 } from "@rakazo/adapters";
 import type { Auth } from "@rakazo/auth";
-import type { Actor, ComputerStatus, McpServer, Me, SpaceNavigation } from "@rakazo/contracts";
+import type { Actor, Bot, ComputerStatus, McpServer, Me, SpaceNavigation } from "@rakazo/contracts";
 import {
   appContract,
   IntegrationProviderIdSchema,
@@ -105,12 +113,14 @@ import {
   CannotDeleteDefaultSpaceError,
   CannotDeleteLastSpaceError,
   CannotDeleteSpaceAsNonOwnerError,
+  ComputerLimitError,
   claimEmptySpaceDeletionForMember,
   createExternalConversationRepos,
   createGroupRepos,
   createRepos,
   createSpaceForMember,
   createThreadMessageInTransaction,
+  defaultModelCredentialCandidates,
   deleteEmptySpaceForMember,
   deleteUnreferencedCredentialSecret,
   findDefaultModelCredential,
@@ -128,6 +138,7 @@ import {
   parseComputerMode,
   releaseSpaceDeletionClaim,
   renewSpaceDeletionClaim,
+  restoreBotUnderComputerQuota,
   SPACE_DELETION_CLAIM_TIMEOUT_MS,
   SpaceDeletionInProgressError,
   SpaceLimitError,
@@ -141,7 +152,16 @@ import { getLogger } from "@rakazo/logging";
 import { deleteAgentSecret, listAgentSecrets, putAgentSecret } from "./agent-secrets.js";
 import { createAgentSkillsService } from "./agent-skills.js";
 import { aiConsentStatus, allowAiConsent } from "./ai-consent.js";
-import { createOwnedArtifact, getOwnedArtifact, getSpaceArtifact } from "./artifacts.js";
+import {
+  ArtifactListCursorError,
+  createOwnedArtifact,
+  deleteArtifactFamily,
+  getOwnedArtifact,
+  getSpaceArtifact,
+  getSpaceArtifactById,
+  listArtifactVersions,
+  listSpaceArtifacts,
+} from "./artifacts.js";
 import { botProfileLabelsChanged, commitBotUpdate } from "./bot-update.js";
 import {
   executionBlocksUserTakeover,
@@ -396,6 +416,23 @@ function connectionContext(
   };
 }
 
+async function assertMcpRemoteEndpoint(
+  endpoint: string | null | undefined,
+  actor: Actor,
+  deps: Pick<RouterDeps, "remoteConnectors" | "env">,
+): Promise<void> {
+  if (!endpoint) return;
+  try {
+    await assertSafeRemoteUrl(endpoint, deps.remoteConnectors?.resolveHostname, {
+      allowPrivateEndpoint: actor.isDeploymentOwner || deps.env.mcpAllowPrivateEndpoint === true,
+    });
+  } catch (error) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: error instanceof Error ? error.message : "MCP endpoint is invalid",
+    });
+  }
+}
+
 function mcpAssignmentDto(row: {
   id: string;
   botId: string;
@@ -455,6 +492,7 @@ export interface RouterDeps {
     updaterToken?: string;
     imageTag?: string;
     integrationsCatalogUrl?: string;
+    mcpAllowPrivateEndpoint?: boolean;
   };
 }
 
@@ -473,7 +511,55 @@ function mapSpaceLifecycleError(error: unknown): unknown {
   if (error instanceof SpaceDeletionInProgressError) {
     return new ORPCError("CONFLICT", { message: error.message });
   }
+  if (error instanceof ComputerLimitError) {
+    return new ORPCError("BAD_REQUEST", { message: error.message });
+  }
   return error;
+}
+
+const BOT_INTRO_PROMPT =
+  "You were just created. In one reply, say what you understood your role to be from your title, description and instructions, and ask for anything you need to get started.";
+
+/**
+ * A freshly created bot otherwise sits silent until someone hands it real work,
+ * so a misunderstood role goes unnoticed until it costs a run. Queue one
+ * invisible-prompt turn (like a routine or skill test run) so its first
+ * message states how it read its own instructions. The executor gives the
+ * "created" trigger no tools (see executor.ts), so this turn can only speak.
+ */
+export async function enqueueBotIntroRun(deps: RouterDeps, actor: Actor, bot: Bot): Promise<void> {
+  const threadId = bot.threadId;
+  if (!threadId) return;
+  // Scripted is the deterministic test/eval runtime, not a real deployment: an
+  // extra automatic run there competes with whatever response a test or eval
+  // harness queued next, for a bot it doesn't otherwise get to opt out of.
+  if (deps.env.agentRuntime === "scripted") return;
+  if ((await modelSetup(deps, actor)).needsModel) return;
+  const run = await deps.prisma.$transaction(async (tx) => {
+    const task = await tx.task.create({
+      data: {
+        spaceId: actor.spaceId,
+        botId: bot.id,
+        threadId,
+        userId: actor.userId,
+        prompt: BOT_INTRO_PROMPT,
+        status: "queued",
+      },
+    });
+    return tx.run.create({
+      data: {
+        spaceId: actor.spaceId,
+        botId: bot.id,
+        threadId,
+        taskId: task.id,
+        userId: actor.userId,
+        status: "queued",
+        trigger: "created",
+      },
+      select: { id: true },
+    });
+  });
+  await deps.jobs.enqueue(runContinueJob(run.id));
 }
 
 export function createRouter(deps: RouterDeps) {
@@ -770,7 +856,14 @@ export function createRouter(deps: RouterDeps) {
       }),
     },
     models: {
-      list: authed.models.list.handler(async () => [...listPiCatalog(), scriptedCatalogEntry]),
+      list: authed.models.list.handler(async ({ context }) => {
+        const auth = await modelCredentialAuthKindsForSpace(
+          deps.prisma,
+          deps.secrets,
+          context.actor,
+        );
+        return [...listAvailablePiCatalog(auth.byProvider, auth.byModel), scriptedCatalogEntry];
+      }),
       credentials: authed.models.credentials.handler(async ({ context }) => {
         const rows = await deps.prisma.userModelCredential.findMany({
           where: { userId: context.actor.userId },
@@ -781,11 +874,10 @@ export function createRouter(deps: RouterDeps) {
           },
           orderBy: newestModelCredentialOrder,
         });
-        const compatibleRows = rows.filter((row) => row.provider === OPENAI_COMPATIBLE_PROVIDER_ID);
-        const secrets = compatibleRows.length
+        const secrets = rows.length
           ? await deps.prisma.secret.findMany({
               where: {
-                id: { in: compatibleRows.map((row) => row.secretId) },
+                id: { in: rows.map((row) => row.secretId) },
                 userId: context.actor.userId,
                 spaceId: null,
               },
@@ -814,26 +906,23 @@ export function createRouter(deps: RouterDeps) {
         try {
           let previousPlaintext: string | undefined;
           let omitVisionModelIds = false;
-          if (input.provider === OPENAI_COMPATIBLE_PROVIDER_ID) {
-            const credential = await findModelCredential(
-              deps.prisma,
-              context.actor,
-              input.provider,
-            );
-            if (credential) {
-              const secret = await deps.prisma.secret.findFirst({
-                where: { id: credential.secretId, userId: context.actor.userId, spaceId: null },
-                select: { ciphertext: true },
-              });
-              if (secret) {
-                try {
-                  previousPlaintext = deps.secrets.load(secret.ciphertext, credential.secretId);
-                } catch (error) {
-                  // Explicit key replacement must still succeed when the prior
-                  // ciphertext is unreadable. Omit visionModelIds so a partial
-                  // one-model list does not wipe other enabled models; DB
-                  // supportsImages + defaultModel remain the legacy fallback.
-                  if (input.apiKey === undefined) throw error;
+          const credential = await findModelCredential(deps.prisma, context.actor, input.provider);
+          if (credential) {
+            const secret = await deps.prisma.secret.findFirst({
+              where: { id: credential.secretId, userId: context.actor.userId, spaceId: null },
+              select: { ciphertext: true },
+            });
+            if (secret) {
+              try {
+                previousPlaintext = deps.secrets.load(secret.ciphertext, credential.secretId);
+              } catch (error) {
+                // Explicit key replacement must still succeed when the prior
+                // ciphertext is unreadable. For OpenAI-compatible connections,
+                // omit visionModelIds so a partial one-model list does not wipe
+                // other enabled models; DB supportsImages + defaultModel remain
+                // the legacy fallback.
+                if (input.apiKey === undefined) throw error;
+                if (input.provider === OPENAI_COMPATIBLE_PROVIDER_ID) {
                   omitVisionModelIds = true;
                 }
               }
@@ -919,16 +1008,68 @@ export function createRouter(deps: RouterDeps) {
         await withSerializableRetry(() =>
           deps.prisma.$transaction(
             async (tx) => {
-              const credential = await tx.userModelCredential.findFirst({
-                where: { userId: context.actor.userId, provider: input.provider },
-                orderBy: newestModelCredentialOrder,
+              const [preferences, credentials] = await Promise.all([
+                tx.spaceModelPreference.findMany({
+                  where: {
+                    spaceId: context.actor.spaceId,
+                    userId: context.actor.userId,
+                    credential: { provider: input.provider },
+                  },
+                  include: { credential: true },
+                }),
+                tx.userModelCredential.findMany({
+                  where: { userId: context.actor.userId, provider: input.provider },
+                }),
+              ]);
+              const candidates = defaultModelCredentialCandidates({
+                provider: input.provider,
+                modelId: input.modelId,
+                preferences,
+                credentials,
               });
-              if (!credential) {
+              if (candidates.length === 0) {
                 throw new ORPCError("NOT_FOUND", {
                   message: `No model credential is connected for ${input.provider}.`,
                 });
               }
-              await selectSpaceModelPreference(tx, context.actor, credential.id, input.modelId);
+              const savedModelId = new Map(
+                preferences.map((preference) => [preference.credential.id, preference.modelId]),
+              );
+              const readyIds: string[] = [];
+              let authFailure: string | undefined;
+              let sawReadable = false;
+              for (const candidate of candidates) {
+                const auth = await readStoredModelAuth(
+                  tx,
+                  deps.secrets,
+                  context.actor.userId,
+                  candidate.secretId,
+                  input.provider,
+                  input.modelId,
+                );
+                if (auth.status === "unreadable") continue;
+                sawReadable = true;
+                if (auth.status === "rejected") {
+                  authFailure ??= auth.message;
+                  continue;
+                }
+                readyIds.push(candidate.id);
+              }
+              const chosenId = selectDefaultCredentialId({
+                provider: input.provider,
+                modelId: input.modelId,
+                orderedIds: candidates.map((candidate) => candidate.id),
+                readyIds,
+                savedModelId: (credentialId) => savedModelId.get(credentialId),
+              });
+              const fallbackId = !sawReadable ? candidates[0]?.id : undefined;
+              const credentialId = chosenId ?? fallbackId;
+              if (!credentialId) {
+                throw new ORPCError("BAD_REQUEST", {
+                  message: authFailure ?? UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+                });
+              }
+              await selectSpaceModelPreference(tx, context.actor, credentialId, input.modelId);
             },
             { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
           ),
@@ -947,11 +1088,16 @@ export function createRouter(deps: RouterDeps) {
         return found;
       }),
       create: authed.bots.create.handler(async ({ context, input }) => {
+        let bot: Bot;
         try {
-          return await repos.createBot(context.actor, input);
+          bot = await repos.createBot(context.actor, input);
         } catch (error) {
           throw mapSpaceLifecycleError(error);
         }
+        await enqueueBotIntroRun(deps, context.actor, bot).catch((error) => {
+          getLogger().error("bot intro run enqueue", error);
+        });
+        return bot;
       }),
       duplicate: authed.bots.duplicate.handler(async ({ context, input }) => {
         const source = await repos.getBot(context.actor, input.botId);
@@ -1009,11 +1155,19 @@ export function createRouter(deps: RouterDeps) {
           });
           if (!section) throw new IsolationError();
         }
-        if (input.modelProvider && input.modelId) {
+        // Web settings resend the saved model on every save. Reject an
+        // incompatible override only when this request is changing it; a run
+        // still rejects a Spark model the subscription sign-in cannot call.
+        const settingModel =
+          input.modelProvider !== undefined &&
+          input.modelId !== undefined &&
+          (input.modelProvider !== existing.modelProvider || input.modelId !== existing.modelId);
+        if (settingModel && input.modelProvider && input.modelId) {
           const credential = await findModelCredential(
             deps.prisma,
             context.actor,
             input.modelProvider,
+            input.modelId,
           );
           if (!credential) {
             throw new ORPCError("BAD_REQUEST", { message: "Connect that model provider first" });
@@ -1024,6 +1178,17 @@ export function createRouter(deps: RouterDeps) {
           );
           if (!inCatalog && credential.defaultModel !== input.modelId) {
             throw new ORPCError("BAD_REQUEST", { message: "Unknown model for that provider" });
+          }
+          if (inCatalog) {
+            const authError = await validateStoredModelAuth(
+              deps.prisma,
+              deps.secrets,
+              context.actor.userId,
+              credential.secretId,
+              input.modelProvider,
+              input.modelId,
+            );
+            if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
           }
         }
         const thinkingLevel = input.thinkingLevel;
@@ -1111,7 +1276,11 @@ export function createRouter(deps: RouterDeps) {
         if (!bot.computer) throw new IsolationError();
         const currentMode = bot.computer.scope === "dedicated" ? "dedicated" : "team";
         if (currentMode === input.mode) {
-          return repos.setBotComputer(context.actor, bot.id, input.mode);
+          try {
+            return await repos.setBotComputer(context.actor, bot.id, input.mode);
+          } catch (error) {
+            throw mapSpaceLifecycleError(error);
+          }
         }
         const claimed = await deps.prisma.$transaction(async (tx) => {
           await tx.$queryRaw`SELECT id FROM computers WHERE id = ${bot.computerId} FOR UPDATE`;
@@ -1158,6 +1327,8 @@ export function createRouter(deps: RouterDeps) {
             });
           }
           return await repos.setBotComputer(context.actor, bot.id, input.mode);
+        } catch (error) {
+          throw mapSpaceLifecycleError(error);
         } finally {
           await deps.prisma.bot.updateMany({
             where: { id: bot.id },
@@ -1184,7 +1355,19 @@ export function createRouter(deps: RouterDeps) {
       restore: authed.bots.restore.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId, { includeArchived: true });
         if (!bot.archivedAt) return { ok: true as const };
-        await deps.prisma.bot.update({ where: { id: bot.id }, data: { archivedAt: null } });
+        try {
+          if (bot.computer) {
+            await restoreBotUnderComputerQuota(deps.prisma, {
+              userId: context.actor.userId,
+              botId: bot.id,
+              computerId: bot.computer.id,
+            });
+          } else {
+            await deps.prisma.bot.update({ where: { id: bot.id }, data: { archivedAt: null } });
+          }
+        } catch (error) {
+          throw mapSpaceLifecycleError(error);
+        }
         return { ok: true as const };
       }),
       remove: authed.bots.remove.handler(async ({ context, input }) => {
@@ -1610,6 +1793,7 @@ export function createRouter(deps: RouterDeps) {
           messageId: input.messageId,
           answeredByUserId: context.actor.userId,
           answer: input.answer,
+          username: input.username,
         });
         if (!answered) {
           throw new ORPCError("CONFLICT", {
@@ -2883,6 +3067,11 @@ export function createRouter(deps: RouterDeps) {
           );
         }),
         create: authed.mcp.servers.create.handler(async ({ context, input }) => {
+          await assertMcpRemoteEndpoint(
+            "endpoint" in input ? input.endpoint : null,
+            context.actor,
+            deps,
+          );
           const secretPayload = buildMcpCredentialBlob(input);
           const stored = secretPayload
             ? await deps.secrets.put(
@@ -2977,6 +3166,9 @@ export function createRouter(deps: RouterDeps) {
               throw new ORPCError("BAD_REQUEST", { message: "A remote MCP server is required" });
             }
             const nextEndpoint = "endpoint" in config ? config.endpoint : null;
+            if (existing.endpoint !== nextEndpoint) {
+              await assertMcpRemoteEndpoint(nextEndpoint, context.actor, deps);
+            }
             const update = buildMcpUpdateMaterial(existingMaterial, config, {
               clearOAuth: existing.endpoint !== nextEndpoint,
             });
@@ -4456,10 +4648,26 @@ export function createRouter(deps: RouterDeps) {
           groupId: row.groupId,
           runId: row.runId,
           name: row.name,
+          description: row.description,
           mimeType: row.mimeType,
           size: row.size,
+          version: row.version,
           createdAt: row.createdAt.toISOString(),
         }));
+      }),
+      listSpace: authed.artifacts.listSpace.handler(async ({ context, input }) => {
+        if (input.botId) await repos.getBot(context.actor, input.botId);
+        try {
+          return await listSpaceArtifacts(deps, context.actor, input);
+        } catch (error) {
+          if (error instanceof ArtifactListCursorError) {
+            throw new ORPCError("BAD_REQUEST", { message: error.message });
+          }
+          throw error;
+        }
+      }),
+      listVersions: authed.artifacts.listVersions.handler(async ({ context, input }) => {
+        return listArtifactVersions(deps, context.actor, input);
       }),
       create: authed.artifacts.create.handler(async ({ context, input }) => {
         const botId = input.botId
@@ -4496,6 +4704,12 @@ export function createRouter(deps: RouterDeps) {
           if (error instanceof IsolationError) throw error;
           throw error;
         }
+      }),
+      getById: authed.artifacts.getById.handler(async ({ context, input }) => {
+        return getSpaceArtifactById(deps, context.actor, input);
+      }),
+      remove: authed.artifacts.remove.handler(async ({ context, input }) => {
+        return deleteArtifactFamily(deps, context.actor, { familyId: input.artifactId });
       }),
     },
     usage: {
@@ -5117,6 +5331,11 @@ async function persistModelCredential(
   },
 ) {
   throwIfAborted(input.signal);
+  const requestedModelId = usableModelId(input.modelId);
+  const authError = requestedModelId
+    ? validateModelAuthAvailability(input.provider, requestedModelId, input.plaintext)
+    : undefined;
+  if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
   const stored = await deps.secrets.put(input.plaintext, {
     operationId: "cred",
     traceId: "cred",
@@ -5166,8 +5385,8 @@ async function persistModelCredential(
             });
         throwIfAborted(input.signal);
         const defaultModel =
-          usableModelId(input.modelId) ??
-          defaultCatalogModelId(input.provider) ??
+          requestedModelId ??
+          defaultCatalogModelId(input.provider, input.plaintext) ??
           usableModelId(deps.env.defaultModel);
         await selectSpaceModelPreference(tx, actor, credential.id, defaultModel);
         throwIfAborted(input.signal);

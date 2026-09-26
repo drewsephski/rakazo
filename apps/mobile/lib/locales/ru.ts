@@ -407,6 +407,7 @@ export const RU_MESSAGES: Record<string, string> = {
   "Reset computer?": "Сбросить компьютер?",
   "Resetting…": "Сброс…",
   Restore: "Восстановить",
+  "Stream replies": "Потоковые ответы",
   "Restore the last saved workspace. Unsaved work on the computer is lost.":
     "Восстановить последнее сохранённое рабочее пространство. Несохранённые данные на компьютере будут потеряны.",
   "Resume notifications": "Возобновить уведомления",
@@ -451,6 +452,7 @@ export const RU_MESSAGES: Record<string, string> = {
   Space: "Пространство",
   "Space actions for {name}": "Действия пространства {name}",
   "Space created": "Пространство создано",
+  "Read replies aloud": "Читать ответы вслух",
   "Speak + transcribe": "Озвучить и расшифровать",
   "Speak message": "Озвучить сообщение",
   Speak: "Озвучить",
@@ -603,4 +605,5 @@ export const RU_MESSAGES: Record<string, string> = {
   "Your phone's built-in voice. Free, no account needed":
     "Встроенный голос телефона. Бесплатно, без аккаунта",
   "Could not save that preference": "Не удалось сохранить эту настройку",
+  Username: "Имя пользователя",
 };

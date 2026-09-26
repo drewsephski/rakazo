@@ -9,7 +9,7 @@ import {
 } from "@rakazo/contracts";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
-import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
 import { BotAvatar } from "../components/bot-avatar";
 import { ComputerModePicker } from "../components/computer-mode-picker";
 import {
@@ -55,6 +55,7 @@ export default function BotSettingsScreen() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [modelKey, setModelKey] = useState("");
   const [thinkingLevel, setThinkingLevel] = useState("");
+  const [autoSpeak, setAutoSpeak] = useState(false);
   const [credentials, setCredentials] = useState<MobileModelCredential[]>([]);
   const [catalog, setCatalog] = useState<MobileModel[]>([]);
   const [me, setMe] = useState<MobileMe | null>(null);
@@ -79,6 +80,7 @@ export default function BotSettingsScreen() {
             : "",
         );
         setThinkingLevel(next.thinkingLevel ?? "");
+        setAutoSpeak(next.autoSpeak);
       })
       .catch((err) => setError(err instanceof Error ? err.message : t("Could not load bot")));
   }, [botId]);
@@ -241,6 +243,7 @@ export default function BotSettingsScreen() {
         modelProvider?: string | null;
         modelId?: string | null;
         thinkingLevel?: ThinkingLevel | null;
+        autoSpeak?: boolean;
       } = { botId };
       if (profile.name !== bot.name) input.name = profile.name;
       if (profile.title !== bot.title) input.title = profile.title;
@@ -263,6 +266,7 @@ export default function BotSettingsScreen() {
           ? ((thinkingLevel || null) as ThinkingLevel | null)
           : null;
       }
+      if (autoSpeak !== bot.autoSpeak) input.autoSpeak = autoSpeak;
       if (computerMode !== bot.computerMode) {
         await rpc(
           "bots/setComputer",
@@ -376,6 +380,25 @@ export default function BotSettingsScreen() {
           ))}
         </ScrollView>
         <ComputerModePicker value={computerMode} onChange={setComputerMode} />
+        <View
+          style={{
+            marginTop: 20,
+            minHeight: 44,
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+          }}
+        >
+          <Text style={{ color: tokens.mutedForeground, fontSize: 14, flex: 1 }}>
+            {t("Read replies aloud")}
+          </Text>
+          <Switch
+            accessibilityLabel={t("Read replies aloud")}
+            value={autoSpeak}
+            onValueChange={setAutoSpeak}
+          />
+        </View>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={t("Advanced")}

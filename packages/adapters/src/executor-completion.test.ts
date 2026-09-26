@@ -6,11 +6,14 @@ import {
   completionNotificationPreview,
   isExactNoResponse,
   LONG_WORK_PROGRESS_GUIDANCE,
+  mayOpenModelStream,
   NO_RESPONSE,
   ROUTINE_SILENT_REPLY_GUIDANCE,
   runAllowsSilentEmpty,
+  runIdentityInstruction,
   runPromotesMidTurnNarration,
   runReplyGuidance,
+  runSendsFinishNotification,
   stripNoResponseReply,
   subagentMarksUnread,
 } from "./executor.js";
@@ -233,6 +236,39 @@ describe("runReplyGuidance", () => {
     expect(runReplyGuidance("routine")).toContain(NO_RESPONSE);
     expect(runReplyGuidance("routine")).toContain(`exactly ${NO_RESPONSE}`);
     expect(runReplyGuidance("routine")).not.toContain("Leave the final reply empty");
+  });
+
+  it("gives the creation intro the profile fields its prompt asks about", () => {
+    const bot = {
+      name: "Ada",
+      title: "Inbox lead",
+      description: "Reads and sorts mail.",
+      instructions: "Never send mail without asking.",
+    };
+    const intro = runIdentityInstruction(bot, "created");
+    expect(intro).toContain("Title: Inbox lead");
+    expect(intro).toContain("Description: Reads and sorts mail.");
+    expect(intro).toContain("Never send mail without asking.");
+    expect(runIdentityInstruction({ ...bot, instructions: "" }, "created")).toContain(
+      "Instructions: (none)",
+    );
+    expect(runIdentityInstruction(bot, "user")).toBe(bot.instructions);
+  });
+
+  it("does not send a finish notification for the creation intro", () => {
+    expect(runSendsFinishNotification("created")).toBe(false);
+    expect(runSendsFinishNotification("user")).toBe(true);
+    expect(runSendsFinishNotification("routine")).toBe(true);
+  });
+
+  it("opens the model stream only for the current running lease", () => {
+    const owned = { status: "running", leaseOwner: "worker-1", leaseFence: 3 };
+    expect(mayOpenModelStream(owned, "worker-1", 3, false)).toBe(true);
+    expect(mayOpenModelStream(owned, "worker-2", 3, false)).toBe(false);
+    expect(mayOpenModelStream(owned, "worker-1", 4, false)).toBe(false);
+    expect(mayOpenModelStream({ ...owned, status: "cancelled" }, "worker-1", 3, false)).toBe(false);
+    expect(mayOpenModelStream(owned, "worker-1", 3, true)).toBe(false);
+    expect(mayOpenModelStream(null, "worker-1", 3, false)).toBe(false);
   });
 
   it("keeps progress guidance for user-triggered runs", () => {

@@ -111,6 +111,8 @@ export class ScriptedAgentRuntime implements AgentRuntime {
             type: "usage",
             inputTokens: 12,
             outputTokens: 40,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
             provider: "scripted",
             model: "scripted",
           };
@@ -192,6 +194,27 @@ export function inferScript(
           },
         ],
         complete: true,
+      },
+    ];
+  }
+  if (lower.includes("show a login card")) {
+    return [
+      {
+        assistant: "i need that sign-in in a protected card.",
+        toolCalls: [
+          {
+            name: "request_secret",
+            args: {
+              label: "Example sign-in",
+              purpose: "password",
+              credential: {
+                name: "example_login",
+                origin: "https://login.example.test",
+                auth: { type: "login" },
+              },
+            },
+          },
+        ],
       },
     ];
   }

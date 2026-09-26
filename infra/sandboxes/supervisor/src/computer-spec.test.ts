@@ -1,9 +1,10 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -210,6 +211,7 @@ describe("graphical computer spec", () => {
 
       try {
         expect(run(":1")).toContain(`--user-data-dir=${home}/.browser-profiles/chromium`);
+        expect(run(":1")).toContain("--restore-last-session");
         expect(run(":1").some((arg) => arg.startsWith("--remote-debugging-port="))).toBe(true);
         expect(run(":2")).toContain(`--user-data-dir=${home}/.browser-profiles/chromium-screen-2`);
         expect(run(":2")).toContain("--remote-debugging-port=9223");
@@ -222,6 +224,7 @@ describe("graphical computer spec", () => {
         }
         const explicit = run(":3", [`--user-data-dir=${home}/custom-profile`]);
         expect(explicit).toContain(`--user-data-dir=${home}/custom-profile`);
+        expect(explicit).toContain("--restore-last-session");
         expect(explicit).not.toContain(
           `--user-data-dir=${home}/.browser-profiles/chromium-screen-3`,
         );
@@ -283,19 +286,160 @@ describe("graphical computer spec", () => {
         expect(updatedLocalState).not.toMatch(/"exited_cleanly"\s*:\s*false/);
 
         writeFileSync(prefsPath, '{\n  "profile": {\n    "exit_type": "Crashed"\n  }\n}\n');
-        symlinkSync("testhost-12345", path.join(profile, "SingletonLock"));
-        const skipped = spawnSync("bash", [path.join(root, "rakazo-browser")], {
-          env: {
-            ...process.env,
-            DISPLAY: ":1",
-            HOME: home,
-            PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
-            RAKAZO_TEST_ARGS: capture,
-          },
-          encoding: "utf8",
+        const sleeper = path.join(bin, "sleeper");
+        writeFileSync(sleeper, "#!/bin/sh\nsleep 120\n");
+        chmodSync(sleeper, 0o755);
+        const liveBrowser = spawn(sleeper, [`--user-data-dir=${profile}`], {
+          stdio: "ignore",
+          detached: true,
         });
-        expect(skipped.status, skipped.error?.message ?? skipped.stderr).toBe(0);
-        expect(readFileSync(prefsPath, "utf8")).toContain("Crashed");
+        const liveLock = path.join(profile, "SingletonLock");
+        const launch = () =>
+          spawnSync("bash", [path.join(root, "rakazo-browser")], {
+            env: {
+              ...process.env,
+              DISPLAY: ":1",
+              HOME: home,
+              PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+              RAKAZO_TEST_ARGS: capture,
+            },
+            encoding: "utf8",
+          });
+        try {
+          symlinkSync(`testhost-${liveBrowser.pid}`, liveLock);
+          const skipped = launch();
+          expect(skipped.status, skipped.error?.message ?? skipped.stderr).toBe(0);
+          expect(readFileSync(prefsPath, "utf8")).toContain("Crashed");
+          expect(readlinkSync(liveLock)).toBe(`testhost-${liveBrowser.pid}`);
+
+          if (process.platform === "linux") {
+            const renderer = spawn(sleeper, ["--type=renderer", `--user-data-dir=${profile}`], {
+              stdio: "ignore",
+              detached: true,
+            });
+            try {
+              writeFileSync(prefsPath, '{\n  "profile": {\n    "exit_type": "Crashed"\n  }\n}\n');
+              rmSync(liveLock);
+              symlinkSync(`testhost-${process.pid}`, liveLock);
+              const reused = launch();
+              expect(reused.status, reused.error?.message ?? reused.stderr).toBe(0);
+              expect(readFileSync(prefsPath, "utf8")).toContain('"exit_type":"Normal"');
+
+              writeFileSync(prefsPath, '{\n  "profile": {\n    "exit_type": "Crashed"\n  }\n}\n');
+              symlinkSync(`testhost-${renderer.pid}`, liveLock);
+              const childLock = launch();
+              expect(childLock.status, childLock.error?.message ?? childLock.stderr).toBe(0);
+              expect(readFileSync(prefsPath, "utf8")).toContain('"exit_type":"Normal"');
+
+              const joiner = path.join(bin, "join-cmdline.py");
+              writeFileSync(
+                joiner,
+                [
+                  "import os, time",
+                  'raw = open("/proc/self/cmdline", "rb").read().rstrip(b"\\0")',
+                  'joined = raw.replace(b"\\0", b" ")',
+                  "start = end = None",
+                  'for line in open("/proc/self/maps"):',
+                  '    if "[stack]" in line:',
+                  '        a, b = line.split()[0].split("-")',
+                  "        start, end = int(a, 16), int(b, 16)",
+                  "        break",
+                  'mem = os.open("/proc/self/mem", os.O_RDWR)',
+                  "pos = end",
+                  "found = None",
+                  "while pos > start:",
+                  "    size = min(1024 * 1024, pos - start)",
+                  "    pos -= size",
+                  "    os.lseek(mem, pos, os.SEEK_SET)",
+                  "    data = os.read(mem, size + len(raw))",
+                  "    idx = data.find(raw)",
+                  "    if idx != -1:",
+                  "        found = pos + idx",
+                  "        break",
+                  "if found is None:",
+                  '    raise SystemExit("cmdline not found")',
+                  "os.lseek(mem, found, os.SEEK_SET)",
+                  "os.write(mem, joined)",
+                  "os.close(mem)",
+                  'open(os.environ["JOINED_READY"], "w").write("ready\\n")',
+                  "time.sleep(120)",
+                  "",
+                ].join("\n"),
+              );
+              const ready = path.join(temp, "joined-ready");
+              const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], {
+                encoding: "utf8",
+              }).stdout.trim();
+              const spacedHome = path.join(temp, "home --type=renderer dir");
+              const spacedProfile = path.join(spacedHome, ".browser-profiles/chromium");
+              const spacedPrefs = path.join(spacedProfile, "Default", "Preferences");
+              mkdirSync(path.dirname(spacedPrefs), { recursive: true });
+              writeFileSync(spacedPrefs, '{\n  "profile": {\n    "exit_type": "Crashed"\n  }\n}\n');
+              const joined = spawn(python, [joiner, `--user-data-dir=${spacedProfile}`], {
+                stdio: "ignore",
+                detached: true,
+                env: { ...process.env, JOINED_READY: ready },
+              });
+              try {
+                const deadline = Date.now() + 2_000;
+                while (spawnSync("test", ["-s", ready]).status !== 0) {
+                  if (Date.now() > deadline)
+                    throw new Error("space-joined command line was not published");
+                  spawnSync("sleep", ["0.02"]);
+                }
+                const spacedLock = path.join(spacedProfile, "SingletonLock");
+                symlinkSync(`testhost-${joined.pid}`, spacedLock);
+                const kept = spawnSync("bash", [path.join(root, "rakazo-browser")], {
+                  env: {
+                    ...process.env,
+                    DISPLAY: ":1",
+                    HOME: spacedHome,
+                    PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+                    RAKAZO_TEST_ARGS: capture,
+                  },
+                  encoding: "utf8",
+                });
+                expect(kept.status, kept.error?.message ?? kept.stderr).toBe(0);
+                expect(readFileSync(spacedPrefs, "utf8")).toContain("Crashed");
+                expect(readlinkSync(spacedLock)).toBe(`testhost-${joined.pid}`);
+              } finally {
+                if (joined.pid) {
+                  try {
+                    process.kill(-joined.pid, "SIGKILL");
+                  } catch {
+                    joined.kill("SIGKILL");
+                  }
+                }
+              }
+            } finally {
+              if (renderer.pid) {
+                try {
+                  process.kill(-renderer.pid, "SIGKILL");
+                } catch {
+                  renderer.kill("SIGKILL");
+                }
+              }
+            }
+          }
+
+          writeFileSync(prefsPath, '{\n  "profile": {\n    "exit_type": "Crashed"\n  }\n}\n');
+          const gone = spawnSync("/bin/sleep", ["0"]);
+          expect(gone.status).toBe(0);
+          expect(spawnSync("kill", ["-0", String(gone.pid)]).status).not.toBe(0);
+          rmSync(liveLock, { force: true });
+          symlinkSync(`testhost-${gone.pid}`, liveLock);
+          const cleared = launch();
+          expect(cleared.status, cleared.error?.message ?? cleared.stderr).toBe(0);
+          expect(readFileSync(prefsPath, "utf8")).toContain('"exit_type":"Normal"');
+        } finally {
+          if (liveBrowser.pid) {
+            try {
+              process.kill(-liveBrowser.pid, "SIGKILL");
+            } catch {
+              liveBrowser.kill("SIGKILL");
+            }
+          }
+        }
       } finally {
         rmSync(temp, { recursive: true, force: true });
       }

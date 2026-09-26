@@ -58,6 +58,7 @@ import {
   speechFromBlocks,
   truncateSlashDescription,
   userVisibleMessages,
+  withLiveStreamingProgress,
 } from "@rakazo/core";
 import {
   AvatarStyleProvider,
@@ -125,9 +126,11 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { AppRail } from "../components/AppRail";
 import { ArtifactFileCard } from "../components/ArtifactFileCard";
 import { AskCard } from "../components/AskCard";
 import { ActiveBotGlyph, CollaborationMarker } from "../components/ai/CollaborationMarker";
@@ -157,6 +160,7 @@ import {
   requestBrowserNotificationPermission,
   shouldNotifyBrowser,
 } from "../lib/browser-notifications";
+import { newClientId } from "../lib/client-id";
 import {
   embeddableScreenUrl,
   loadComputerScreen,
@@ -174,6 +178,7 @@ import {
 } from "../lib/pending-attachments";
 import { markAfterPaint, markOnce } from "../lib/performance";
 import { quoteDraftForSelection } from "../lib/quote-selection";
+import { getResponseStreamingEnabled, subscribeResponseStreaming } from "../lib/response-streaming";
 import { clearSpaceSelection, rpc, selectedSpaceId, selectSpace } from "../lib/rpc";
 import { readSeenRunErrorIds, rememberSeenRunErrorId } from "../lib/run-error-storage";
 import { sharedInflight } from "../lib/shared-inflight";
@@ -358,6 +363,13 @@ export function ShellPage() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [snapshot, setSnapshot] = useState<ThreadSnapshot | null>(null);
   const snapshotRef = useRef<ThreadSnapshot | null>(null);
+  const streamResponses = useSyncExternalStore(
+    subscribeResponseStreaming,
+    getResponseStreamingEnabled,
+    () => false,
+  );
+  const streamResponsesRef = useRef(streamResponses);
+  streamResponsesRef.current = streamResponses;
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [replyTarget, setReplyTarget] = useState<ThreadMessage | null>(null);
   const [replyQuote, setReplyQuote] = useState<string | null>(null);
@@ -424,8 +436,12 @@ export function ShellPage() {
 
   function commitSnapshot(next: ThreadSnapshot | null) {
     snapshotRef.current = next;
-    setSnapshot(next);
+    setSnapshot(withLiveStreamingProgress(next, streamResponsesRef.current));
   }
+
+  useEffect(() => {
+    setSnapshot(withLiveStreamingProgress(snapshotRef.current, streamResponses));
+  }, [streamResponses]);
 
   function commitComputer(next: ComputerStatus | null) {
     computerRef.current = next;
@@ -1874,22 +1890,26 @@ export function ShellPage() {
     const botId = activeBotId.current;
     if (botId) void jumpToMessageRef.current({ botId, messageId });
   }, []);
-  const answerMessage = useCallback(async (message: ThreadMessage, text: string) => {
-    const botId = activeBotId.current;
-    const groupId = activeGroupId.current;
-    if (!botId && !groupId) return;
-    await rpc.threads.answer({
-      ...(groupId ? { groupId } : { botId: botId! }),
-      runId: message.runId ?? "",
-      messageId: message.id,
-      answer: text,
-    });
-    if (groupId && activeGroupId.current === groupId) {
-      await refreshGroupThreadRef.current(groupId);
-    } else if (botId && activeBotId.current === botId) {
-      await refreshThreadRef.current(botId);
-    }
-  }, []);
+  const answerMessage = useCallback(
+    async (message: ThreadMessage, text: string, username?: string) => {
+      const botId = activeBotId.current;
+      const groupId = activeGroupId.current;
+      if (!botId && !groupId) return;
+      await rpc.threads.answer({
+        ...(groupId ? { groupId } : { botId: botId! }),
+        runId: message.runId ?? "",
+        messageId: message.id,
+        answer: text,
+        ...(username ? { username } : {}),
+      });
+      if (groupId && activeGroupId.current === groupId) {
+        await refreshGroupThreadRef.current(groupId);
+      } else if (botId && activeBotId.current === botId) {
+        await refreshThreadRef.current(botId);
+      }
+    },
+    [],
+  );
   const reactToMessage = useCallback(
     async (message: ThreadMessage, reaction: MessageReaction) => {
       const botId = activeBotId.current;
@@ -2632,6 +2652,7 @@ export function ShellPage() {
           className="absolute bottom-20 start-0 top-16 z-20 w-8 touch-none md:hidden"
         />
       ) : null}
+      <AppRail active="bots" />
       <aside
         data-testid="bots-sidebar"
         data-collapsed={botsSidebarCollapsed ? "true" : "false"}
@@ -4391,7 +4412,7 @@ const Transcript = memo(function Transcript({
   workingBots: GroupAvatarMember[];
   onLoadOlder: () => void | Promise<void>;
   onOpenBot: (botId: string) => void;
-  onAnswer: (message: ThreadMessage, text: string) => Promise<void>;
+  onAnswer: (message: ThreadMessage, text: string, username?: string) => Promise<void>;
   onReply: (message: ThreadMessage) => void;
   onQuote: (message: ThreadMessage, quote: string) => void;
   onReact: (message: ThreadMessage, reaction: MessageReaction) => Promise<void>;
@@ -4639,8 +4660,8 @@ const Transcript = memo(function Transcript({
                       ? undefined
                       : `relative w-fit min-w-0 ${
                           message.role === "user"
-                            ? "max-w-[min(70%,calc(100%_-_6rem))]"
-                            : "max-w-[min(74%,calc(100%_-_6rem))]"
+                            ? "max-w-[min(84%,calc(100%_-_6rem))]"
+                            : "max-w-[min(88%,calc(100%_-_6rem))]"
                         }`
                   }
                 >
@@ -5758,7 +5779,7 @@ const MessageView = memo(function MessageView({
   artifactTarget: ArtifactTarget;
   canAnswer: boolean;
   message: ThreadMessage;
-  onAnswer: (message: ThreadMessage, text: string) => Promise<void>;
+  onAnswer: (message: ThreadMessage, text: string, username?: string) => Promise<void>;
   onOpenBot: (botId: string) => void;
   onOpenPeerMessages: (peer: { peerBotId: string; peerBotName: string }) => void;
   speakerName?: string;
@@ -6139,7 +6160,7 @@ const MessageView = memo(function MessageView({
               key={i}
               block={block}
               canAnswer={canAnswer}
-              onAnswer={(text) => onAnswer(message, text)}
+              onAnswer={(text, username) => onAnswer(message, text, username)}
             />
           );
         }
@@ -6219,11 +6240,7 @@ function computerLabel(mode: ComputerStatus["mode"] | undefined, botName: string
 }
 
 function newClientNonce(): string {
-  const webCrypto = globalThis.crypto;
-  if (webCrypto && typeof webCrypto.randomUUID === "function") {
-    return webCrypto.randomUUID();
-  }
-  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return newClientId();
 }
 
 function readFileAsBase64(file: File): Promise<string> {

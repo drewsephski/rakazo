@@ -17,6 +17,7 @@ import react from "@vitejs/plugin-react";
 import type { PreviewServer, ViteDevServer } from "vite";
 import { defineConfig, loadEnv } from "vite";
 import { resolveScreenProxySecret } from "../../packages/core/src/secrets-guard.ts";
+import { collectNovncHtml, MAX_NOVNC_HTML_BYTES } from "./src/novnc-html.js";
 import {
   resolveNovncTarget,
   safeProxyHeaders,
@@ -75,6 +76,7 @@ function attachNovncProxy(server: ViteDevServer | PreviewServer, secret: string,
     }
     const headers = {
       ...safeProxyHeaders(req.headers),
+      ...(isCreateOSNovncHost(target.hostname) ? { "accept-encoding": "identity" } : {}),
       host: `${target.hostname}:${target.port}`,
     };
     const transport = target.protocol === "https:" ? https : http;
@@ -102,6 +104,18 @@ function attachNovncProxy(server: ViteDevServer | PreviewServer, secret: string,
       }
       return true;
     };
+    let downstreamFinished = false;
+    const finishUnavailable = () => {
+      if (downstreamFinished || res.destroyed || res.writableEnded) return;
+      downstreamFinished = true;
+      stopChecking();
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.statusCode = 502;
+      res.end("Screen unavailable");
+    };
     function requestUpstream() {
       if (res.destroyed) return;
       upstream = transport.request(
@@ -117,24 +131,43 @@ function attachNovncProxy(server: ViteDevServer | PreviewServer, secret: string,
           if ((incoming.statusCode ?? 502) >= 500 && scheduleRetry(incoming)) {
             return;
           }
-          res.writeHead(
-            incoming.statusCode ?? 502,
-            safeScreenProxyResponseHeaders(incoming.headers),
-          );
+          const responseHeaders = safeScreenProxyResponseHeaders(incoming.headers);
+          if (shouldInjectNovncStorageShim(responseHeaders, target.hostname)) {
+            const declaredLength = Number(incoming.headers["content-length"] ?? 0);
+            if (Number.isFinite(declaredLength) && declaredLength > MAX_NOVNC_HTML_BYTES) {
+              finishUnavailable();
+              incoming.destroy();
+              return;
+            }
+            void collectNovncHtml(incoming, MAX_NOVNC_HTML_BYTES)
+              .then((html) => {
+                if (downstreamFinished || res.destroyed || res.writableEnded) return;
+                downstreamFinished = true;
+                const body = injectNovncStorageShim(html);
+                delete responseHeaders["content-length"];
+                res.writeHead(incoming.statusCode ?? 502, responseHeaders);
+                res.end(body);
+              })
+              .catch(() => {
+                finishUnavailable();
+              });
+            return;
+          }
+          res.writeHead(incoming.statusCode ?? 502, responseHeaders);
           incoming.pipe(res);
         },
       );
       upstream.on("error", () => {
-        if (retryable && !res.headersSent && !res.destroyed && (retryPending || scheduleRetry())) {
+        if (
+          retryable &&
+          !downstreamFinished &&
+          !res.headersSent &&
+          !res.destroyed &&
+          (retryPending || scheduleRetry())
+        ) {
           return;
         }
-        stopChecking();
-        if (res.headersSent) {
-          res.destroy();
-          return;
-        }
-        res.statusCode = 502;
-        res.end("Screen unavailable");
+        finishUnavailable();
       });
       if (req.method === "GET" || req.readableEnded) upstream.end();
       else req.pipe(upstream);
@@ -223,6 +256,36 @@ function attachNovncProxy(server: ViteDevServer | PreviewServer, secret: string,
     upstream.on("error", () => socket.destroy());
     socket.on("error", () => upstream.destroy());
   });
+}
+
+const NOVNC_STORAGE_SHIM_HOSTS = [".app.sb.createos.sh"];
+
+function isCreateOSNovncHost(hostname: string) {
+  return NOVNC_STORAGE_SHIM_HOSTS.some((suffix) => hostname.endsWith(suffix));
+}
+
+function shouldInjectNovncStorageShim(headers: http.IncomingHttpHeaders, hostname: string) {
+  if (!isCreateOSNovncHost(hostname)) return false;
+  if (headers["content-encoding"]) return false;
+  const contentType = String(headers["content-type"] ?? "").toLowerCase();
+  return contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
+}
+
+function injectNovncStorageShim(html: string) {
+  const shim = `<script>
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: {
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {},
+    clear() {},
+  },
+});
+</script>`;
+  return html.includes("<head>")
+    ? html.replace("<head>", `<head>${shim}`)
+    : html.replace(/<script\b/i, `${shim}<script`);
 }
 
 export default defineConfig(({ mode }) => {

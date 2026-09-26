@@ -47,6 +47,7 @@ import {
   clipToolResultText,
   MODEL_STREAM_MAX_RETRIES,
   MODEL_STREAM_TIMEOUT_MS,
+  REASONING_MODEL_MAX_TOKENS,
   resolveCompletionMaxTokens,
 } from "./pi-runtime-limits.js";
 import {
@@ -377,11 +378,18 @@ export class PiAgentRuntime implements AgentRuntime {
               queue.push({ type: "text", text });
             }
             if ("usage" in event.message && event.message.usage) {
+              const usage = billedPromptTokens(event.message.usage);
               queue.push({
                 type: "usage",
-                ...billedPromptTokens(event.message.usage),
+                ...usage,
                 provider: model.provider,
                 model: model.id,
+              });
+              getLogger().debug("model usage", {
+                runId: request.runId,
+                provider: model.provider,
+                model: model.id,
+                ...usage,
               });
             }
           }
@@ -486,6 +494,10 @@ function configuredOpenRouterModel(id: string): Model<"openai-completions"> {
   // pricing conservative, but enable reasoning: unknown OpenRouter endpoints
   // (e.g. gemini-3.7-flash before the snapshot catches up) often mandate it, and
   // thinkingLevel "off" becomes effort "none" which those endpoints reject.
+  // The output ceiling follows from that reasoning flag: a 4k placeholder would
+  // clamp the reasoning budget back to a size the thinking alone can consume.
+  // It cannot outgrow the conservative window this placeholder also assumes.
+  const contextWindow = 16_384;
   return {
     id,
     name: id,
@@ -495,8 +507,8 @@ function configuredOpenRouterModel(id: string): Model<"openai-completions"> {
     reasoning: true,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 16_384,
-    maxTokens: 4_096,
+    contextWindow,
+    maxTokens: Math.min(REASONING_MODEL_MAX_TOKENS, contextWindow),
   };
 }
 
@@ -754,7 +766,11 @@ export function prepareRequestSecretArguments(raw: Record<string, unknown>) {
   const label = raw.label == null ? "" : String(raw.label);
   const purpose = raw.purpose == null ? "" : String(raw.purpose);
   if (!label.trim() || !purpose.trim()) {
-    throw new Error("request_secret requires a non-empty label and purpose");
+    throw new Error(
+      `request_secret requires a non-empty label and purpose (received: ${
+        Object.keys(raw).sort().join(", ") || "no arguments"
+      })`,
+    );
   }
   return {
     label,
@@ -1121,11 +1137,18 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
       const text = assistantText(event.message);
       if (text && !streamed) streamed = text;
       if ("usage" in event.message && event.message.usage) {
+        const usage = billedPromptTokens(event.message.usage);
         host.queue.push({
           type: "usage",
-          ...billedPromptTokens(event.message.usage),
+          ...usage,
           provider: subagentModel.provider,
           model: subagentModel.id,
+        });
+        getLogger().debug("model usage", {
+          runId: host.request.runId,
+          provider: subagentModel.provider,
+          model: subagentModel.id,
+          ...usage,
         });
       }
     }
@@ -1717,7 +1740,12 @@ function endToolCall(host: ToolHost) {
 }
 
 function modelForCompletion(model: Model<Api>, configuredMaxTokens?: number): Model<Api> {
-  const maxTokens = resolveCompletionMaxTokens(model.maxTokens, configuredMaxTokens);
+  const maxTokens = resolveCompletionMaxTokens(
+    model.maxTokens,
+    configuredMaxTokens,
+    undefined,
+    model.reasoning,
+  );
   if (maxTokens === model.maxTokens) return model;
   return { ...model, maxTokens };
 }
@@ -1777,7 +1805,7 @@ function createQueue(): EventQueue {
 }
 
 export function reliableStreamOptions(
-  model: Pick<Model<Api>, "api" | "provider" | "maxTokens">,
+  model: Pick<Model<Api>, "api" | "provider" | "maxTokens" | "reasoning">,
   options?: SimpleStreamOptions,
   configuredMaxTokens?: number,
 ): SimpleStreamOptions {
@@ -1785,7 +1813,12 @@ export function reliableStreamOptions(
     ...options,
     timeoutMs: options?.timeoutMs ?? MODEL_STREAM_TIMEOUT_MS,
     maxRetries: options?.maxRetries ?? MODEL_STREAM_MAX_RETRIES,
-    maxTokens: resolveCompletionMaxTokens(model.maxTokens, configuredMaxTokens, options?.maxTokens),
+    maxTokens: resolveCompletionMaxTokens(
+      model.maxTokens,
+      configuredMaxTokens,
+      options?.maxTokens,
+      model.reasoning,
+    ),
   };
 
   if (model.provider === "openai-codex" || model.api === "openai-codex-responses") {

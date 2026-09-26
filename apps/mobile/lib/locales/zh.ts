@@ -388,6 +388,7 @@ export const ZH_MESSAGES: Record<string, string> = {
   "Reset computer?": "要重置电脑吗？",
   "Resetting…": "正在重置…",
   Restore: "恢复",
+  "Stream replies": "流式回复",
   "Restore the last saved workspace. Unsaved work on the computer is lost.":
     "恢复上次保存的工作区。电脑上未保存的工作将会丢失。",
   "Resume notifications": "恢复通知",
@@ -434,6 +435,7 @@ export const ZH_MESSAGES: Record<string, string> = {
   "This removes the empty space for everyone.": "这将为所有人删除此空空间。",
   "Space created": "空间已创建",
   "Space default": "空间默认",
+  "Read replies aloud": "朗读回复",
   "Speak + transcribe": "朗读并转写",
   "Speak message": "朗读消息",
   Speak: "朗读",
@@ -586,4 +588,5 @@ export const ZH_MESSAGES: Record<string, string> = {
   "On · Free, works offline": "已开启 · 免费，可离线使用",
   "Your phone's built-in voice. Free, no account needed": "手机自带的语音。免费，无需账户",
   "Could not save that preference": "无法保存该设置",
+  Username: "用户名",
 };

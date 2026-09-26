@@ -11,6 +11,8 @@ import {
 } from "@rakazo/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { createApp } from "../../../apps/api/src/app.ts";
+import type { BotIntroHarness } from "./discard-bot-intro.js";
+import { discardBotIntroFromCreate } from "./discard-bot-intro.js";
 import { sessionCookieHeader } from "./index.js";
 
 type App = { request: (input: string, init?: RequestInit) => Response | Promise<Response> };
@@ -30,6 +32,7 @@ process.env.AGENT_RUNTIME = "scripted";
 
 const hasDb = process.env.VERIFY_DATABASE === "1" && Boolean(process.env.DATABASE_URL);
 const describeWithDatabase = hasDb ? describe : describe.skip;
+let botIntroHarness: BotIntroHarness | undefined;
 
 describeWithDatabase("API authorization and resource isolation", () => {
   let handles: AppHandles;
@@ -49,6 +52,7 @@ describeWithDatabase("API authorization and resource isolation", () => {
       composio: new ComposioEmulator(),
     });
     app = handles.app;
+    botIntroHarness = handles;
   });
 
   afterAll(async () => {
@@ -1251,7 +1255,7 @@ describeWithDatabase("API authorization and resource isolation", () => {
     expect(await partialClear.text()).toMatch(/both be set or both cleared/i);
   });
 
-  it("chooses the newest duplicate provider credential when selecting a default", async () => {
+  it("binds a new default to the space preference credential, not a newer unused duplicate", async () => {
     const cookie = await signup(app, `model-duplicates-${stamp}@rakazo.test`, "Model Duplicates");
     const actor = await rpc<Actor>(app, cookie, "me");
     const olderSecret = await handles.prisma.secret.create({
@@ -1309,16 +1313,13 @@ describeWithDatabase("API authorization and resource isolation", () => {
       where: { userId: actor.userId, spaceId: actor.spaceId },
     });
     expect(preferences.filter((row) => row.isDefault).map((row) => row.credentialId)).toEqual([
-      newer.id,
+      older.id,
     ]);
-    expect(preferences.find((row) => row.credentialId === newer.id)).toMatchObject({
+    expect(preferences.find((row) => row.credentialId === older.id)).toMatchObject({
       isDefault: true,
       modelId: "newer/selected",
     });
-    expect(preferences.find((row) => row.credentialId === older.id)).toMatchObject({
-      isDefault: false,
-      modelId: "older/model",
-    });
+    expect(preferences.find((row) => row.credentialId === newer.id)).toBeUndefined();
     const listed = await rpc<ModelCredential[]>(app, cookie, "models/credentials");
     expect(
       listed.filter((row) => row.provider === "duplicate-provider").map((row) => row.id),
@@ -1496,7 +1497,7 @@ async function rpc<T>(
   if (response.status >= 400 || payload.error) {
     throw new Error(`${procedure} ${response.status}: ${payload.error?.message ?? text}`);
   }
-  return payload.json as T;
+  return discardBotIntroFromCreate(botIntroHarness, cookie, procedure, payload.json as T);
 }
 
 async function expectDenied(

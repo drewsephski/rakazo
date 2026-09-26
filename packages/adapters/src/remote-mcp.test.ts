@@ -1,8 +1,9 @@
 import dns from "node:dns";
 import { fetch as undiciFetch } from "undici";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   assertSafeRemoteUrl,
+  createPrivateNetworkFetch,
   createSafeLookup,
   createSafeRemoteFetch,
   limitRemoteMcpPayload,
@@ -15,6 +16,108 @@ describe("remote MCP URL policy", () => {
     await expect(
       assertSafeRemoteUrl("https://connectors.example.test/mcp", publicResolver),
     ).resolves.toEqual(new URL("https://connectors.example.test/mcp"));
+  });
+
+  it("accepts public HTTPS endpoints when the private-endpoint escape is on", async () => {
+    await expect(
+      assertSafeRemoteUrl("https://connectors.example.test/mcp", publicResolver, {
+        allowPrivateEndpoint: true,
+      }),
+    ).resolves.toEqual(new URL("https://connectors.example.test/mcp"));
+  });
+
+  it("blocks private hosts by default", async () => {
+    await expect(assertSafeRemoteUrl("https://10.0.0.8/mcp", publicResolver)).rejects.toThrow(
+      /private host/i,
+    );
+    await expect(
+      assertSafeRemoteUrl("http://192.168.1.20:3927/mcp", publicResolver),
+    ).rejects.toThrow(/HTTPS/i);
+    await expect(
+      assertSafeRemoteUrl("https://host.docker.internal/mcp", publicResolver),
+    ).rejects.toThrow(/private host/i);
+  });
+
+  it("allows private LAN hosts when the deployment-owner escape is enabled", async () => {
+    await expect(
+      assertSafeRemoteUrl("https://10.0.0.8/mcp", publicResolver, { allowPrivateEndpoint: true }),
+    ).resolves.toEqual(new URL("https://10.0.0.8/mcp"));
+    await expect(
+      assertSafeRemoteUrl("http://192.168.1.20:3927/mcp", publicResolver, {
+        allowPrivateEndpoint: true,
+      }),
+    ).resolves.toEqual(new URL("http://192.168.1.20:3927/mcp"));
+    await expect(
+      assertSafeRemoteUrl(
+        "http://host.docker.internal:3927/mcp",
+        async () => [{ address: "192.168.65.254", family: 4 as const }],
+        {
+          allowPrivateEndpoint: true,
+        },
+      ),
+    ).resolves.toEqual(new URL("http://host.docker.internal:3927/mcp"));
+  });
+
+  it.each([
+    "https://169.254.169.254/latest/meta-data",
+    "https://169.254.170.2/latest/meta-data",
+    "https://100.100.100.200/latest/meta-data",
+    "https://metadata.google.internal/computeMetadata/v1/",
+    "https://metadata.goog/",
+  ])(
+    "still blocks cloud metadata %s when the private-endpoint escape is enabled",
+    async (endpoint) => {
+      await expect(
+        assertSafeRemoteUrl(endpoint, publicResolver, {
+          allowPrivateEndpoint: true,
+        }),
+      ).rejects.toThrow(/private host/i);
+    },
+  );
+
+  it("rejects a private-suffix hostname that resolves to link-local metadata", async () => {
+    await expect(
+      assertSafeRemoteUrl(
+        "https://nas.local/mcp",
+        async () => [{ address: "169.254.170.2", family: 4 as const }],
+        { allowPrivateEndpoint: true },
+      ),
+    ).rejects.toThrow("private address");
+  });
+
+  it("allows HTTP loopback without the private-endpoint escape", async () => {
+    await expect(assertSafeRemoteUrl("http://127.0.0.1:3927/mcp", publicResolver)).resolves.toEqual(
+      new URL("http://127.0.0.1:3927/mcp"),
+    );
+  });
+
+  it("rejects HTTP when a private-suffix hostname resolves publicly", async () => {
+    await expect(
+      assertSafeRemoteUrl("http://mcp.internal/mcp", publicResolver, {
+        allowPrivateEndpoint: true,
+      }),
+    ).rejects.toThrow(/HTTPS/i);
+  });
+
+  it("rejects public HTTP even when the private-endpoint escape is enabled", async () => {
+    await expect(
+      assertSafeRemoteUrl("http://connectors.example.test/mcp", publicResolver, {
+        allowPrivateEndpoint: true,
+      }),
+    ).rejects.toThrow(/HTTPS/i);
+  });
+
+  it("allows a hostname that resolves privately only when the escape is enabled", async () => {
+    const lanResolver = async () => [{ address: "10.1.2.3", family: 4 as const }];
+    await expect(assertSafeRemoteUrl("https://mcp.lan.test/mcp", lanResolver)).rejects.toThrow(
+      "private address",
+    );
+    await expect(
+      assertSafeRemoteUrl("https://mcp.lan.test/mcp", lanResolver, { allowPrivateEndpoint: true }),
+    ).resolves.toEqual(new URL("https://mcp.lan.test/mcp"));
+    await expect(
+      assertSafeRemoteUrl("http://mcp.lan.test/mcp", lanResolver, { allowPrivateEndpoint: true }),
+    ).resolves.toEqual(new URL("http://mcp.lan.test/mcp"));
   });
 
   it("accepts hosts that resolve to a public IPv6 address", async () => {
@@ -128,6 +231,52 @@ describe("remote MCP URL policy", () => {
       });
     });
     expect(error).toMatchObject({ message: "Connector URL resolves to a private address" });
+  });
+
+  it("permits verified loopback addresses for localhost HTTP through the guarded Agent lookup", async () => {
+    const loopbackResolver = async () => [{ address: "127.0.0.1", family: 4 as const }];
+    const safeLookup = createSafeLookup(loopbackResolver);
+    const result = await new Promise<{ address: string; family?: number }>((resolve, reject) => {
+      safeLookup("localhost", { family: 0, all: false }, (error, address, family) => {
+        if (error) reject(error);
+        else resolve({ address: String(address), family });
+      });
+    });
+    expect(result).toEqual({ address: "127.0.0.1", family: 4 });
+
+    const reboundLookup = createSafeLookup(async () => [{ address: "10.1.2.3", family: 4 }]);
+    const reboundError = await new Promise<Error | null>((resolve) => {
+      reboundLookup("localhost", { family: 0, all: false }, (lookupError) => {
+        resolve(lookupError);
+      });
+    });
+    expect(reboundError).toMatchObject({
+      message: "Connector URL resolves to a private address",
+    });
+
+    const publicLoopbackLookup = createSafeLookup(loopbackResolver);
+    const publicError = await new Promise<Error | null>((resolve) => {
+      publicLoopbackLookup("connectors.example.test", { family: 0, all: false }, (lookupError) => {
+        resolve(lookupError);
+      });
+    });
+    expect(publicError).toMatchObject({
+      message: "Connector URL resolves to a private address",
+    });
+
+    expect(undiciFetch).not.toBe(globalThis.fetch);
+    const safeFetch = createSafeRemoteFetch(undefined, loopbackResolver);
+    try {
+      const error = await safeFetch("http://localhost:59999/mcp").then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/^Could not reach localhost:59999/);
+      expect((error as Error).message).not.toMatch(/private address/);
+    } finally {
+      await safeFetch.close();
+    }
   });
 
   it("returns the validated address directly to the network connection", async () => {
@@ -367,5 +516,51 @@ describe("remote MCP result limits", () => {
     expect(limited.truncated).toBe(true);
     expect(Buffer.byteLength(limited.content, "utf8")).toBeLessThanOrEqual(1_000_000);
     expect(limited.content).not.toContain("\uFFFD");
+  });
+});
+
+describe("createPrivateNetworkFetch", () => {
+  const lanResolver = async () => [{ address: "192.168.2.10", family: 4 as const }];
+  const mockFetch = () =>
+    vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => Response.json({ ok: true }));
+
+  it("delivers to a private HTTP destination", async () => {
+    const baseFetch = mockFetch();
+    const fetch = createPrivateNetworkFetch(baseFetch, lanResolver);
+    const response = await fetch("http://192.168.2.10:8080/v1/items", { method: "GET" });
+    expect(response.status).toBe(200);
+    expect(baseFetch).toHaveBeenCalledOnce();
+    expect(String(baseFetch.mock.calls[0]?.[0])).toBe("http://192.168.2.10:8080/v1/items");
+  });
+
+  it("rejects an opted-in host that resolves to a mapped link-local address", async () => {
+    const baseFetch = mockFetch();
+    const fetch = createPrivateNetworkFetch(baseFetch, async () => [
+      { address: "::ffff:169.254.170.2", family: 6 as const },
+    ]);
+    await expect(fetch("http://nas.local:8080/v1/items", { method: "GET" })).rejects.toThrow(
+      "non-private address",
+    );
+    expect(baseFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects an opted-in host that resolves to a public address", async () => {
+    const baseFetch = mockFetch();
+    const fetch = createPrivateNetworkFetch(baseFetch, publicResolver);
+    await expect(fetch("http://nas.local:8080/v1/items", { method: "GET" })).rejects.toThrow(
+      "non-private address",
+    );
+    expect(baseFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects redirect responses instead of returning them", async () => {
+    const baseFetch = vi.fn(
+      async () =>
+        new Response(null, { status: 302, headers: { location: "http://10.9.9.9/exfil" } }),
+    );
+    const fetch = createPrivateNetworkFetch(baseFetch, lanResolver);
+    await expect(fetch("http://192.168.2.10:8080/v1/items", { method: "GET" })).rejects.toThrow(
+      "redirects are not allowed",
+    );
   });
 });

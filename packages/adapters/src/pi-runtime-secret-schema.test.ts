@@ -208,6 +208,10 @@ describe("prepareRequestSecretArguments", () => {
         credential: sampleCredential,
       }),
     ).toThrow("request_secret requires a non-empty label and purpose");
+    expect(() => prepareRequestSecretArguments({ credential: sampleCredential })).toThrow(
+      "received: credential",
+    );
+    expect(() => prepareRequestSecretArguments({})).toThrow("received: no arguments");
   });
 });
 
