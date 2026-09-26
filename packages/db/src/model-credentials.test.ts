@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PrismaClient } from "./client.js";
 import {
   chooseModelCredential,
+  defaultModelCredentialCandidates,
   findDefaultModelCredential,
   findModelCredential,
   newestModelCredentialOrder,
@@ -220,6 +221,99 @@ describe("chooseModelCredential", () => {
       source: "preference",
       preference: expect.objectContaining({ credential: apiKey }),
     });
+  });
+
+  it("lists an open credential before a preference that owns a different model", () => {
+    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
+    const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
+    const candidates = defaultModelCredentialCandidates({
+      provider: "openai-codex",
+      modelId: "gpt-6-luna",
+      preferences: [
+        {
+          id: "pref-spark",
+          modelId: "gpt-5.3-codex-spark",
+          isDefault: true,
+          updatedAt: new Date("2026-02-01T00:00:00.000Z"),
+          credential: apiKey,
+        },
+      ],
+      credentials: [apiKey, oauth],
+    });
+    expect(candidates.map((item) => item.id)).toEqual(["oauth", "api"]);
+  });
+
+  it("keeps the model owner as the only default candidate", () => {
+    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
+    const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
+    const candidates = defaultModelCredentialCandidates({
+      provider: "openai-codex",
+      modelId: "gpt-5.3-codex-spark",
+      preferences: [
+        {
+          id: "pref-spark",
+          modelId: "gpt-5.3-codex-spark",
+          isDefault: false,
+          updatedAt: new Date("2026-02-01T00:00:00.000Z"),
+          credential: apiKey,
+        },
+        {
+          id: "pref-luna",
+          modelId: "gpt-6-luna",
+          isDefault: true,
+          updatedAt: new Date("2026-03-02T00:00:00.000Z"),
+          credential: oauth,
+        },
+      ],
+      credentials: [oauth, apiKey],
+    });
+    expect(candidates.map((item) => item.id)).toEqual(["api"]);
+  });
+
+  it("tries another bound credential before the provider fallback", () => {
+    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
+    const oauth = credential("oauth", "2026-03-01T00:00:00.000Z");
+    const candidates = defaultModelCredentialCandidates({
+      provider: "openai-codex",
+      modelId: "gpt-6-luna",
+      preferences: [
+        {
+          id: "pref-spark",
+          modelId: "gpt-5.3-codex-spark",
+          isDefault: true,
+          updatedAt: new Date("2026-02-01T00:00:00.000Z"),
+          credential: apiKey,
+        },
+        {
+          id: "pref-other",
+          modelId: "gpt-5.4",
+          isDefault: false,
+          updatedAt: new Date("2026-03-02T00:00:00.000Z"),
+          credential: oauth,
+        },
+      ],
+      credentials: [apiKey, oauth],
+    });
+    expect(candidates.map((item) => item.id)).toEqual(["oauth", "api"]);
+  });
+
+  it("still offers the only credential when its preference owns a different model", () => {
+    const apiKey = credential("api", "2026-01-01T00:00:00.000Z");
+    const candidates = defaultModelCredentialCandidates({
+      provider: "openai-codex",
+      modelId: "gpt-6-luna",
+      preferences: [
+        {
+          id: "pref-spark",
+          modelId: "gpt-5.3-codex-spark",
+          isDefault: true,
+          updatedAt: apiKey.updatedAt,
+          credential: apiKey,
+        },
+      ],
+      credentials: [apiKey],
+    });
+    expect(candidates.map((item) => item.id)).toEqual(["api"]);
   });
 
   it("keeps the newest account credential when the space has no preference", () => {

@@ -82,6 +82,7 @@ import {
   takeoverLeaseMs,
   toComputerRef,
   touchRunningComputer,
+  UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
   validateModelAuthAvailability,
   validateStoredModelAuth,
   verifyMcpInstall,
@@ -111,13 +112,13 @@ import {
   CannotDeleteLastSpaceError,
   CannotDeleteSpaceAsNonOwnerError,
   ComputerLimitError,
-  chooseModelCredential,
   claimEmptySpaceDeletionForMember,
   createExternalConversationRepos,
   createGroupRepos,
   createRepos,
   createSpaceForMember,
   createThreadMessageInTransaction,
+  defaultModelCredentialCandidates,
   deleteEmptySpaceForMember,
   deleteUnreferencedCredentialSecret,
   findDefaultModelCredential,
@@ -1018,29 +1019,37 @@ export function createRouter(deps: RouterDeps) {
                   where: { userId: context.actor.userId, provider: input.provider },
                 }),
               ]);
-              const choice = chooseModelCredential({
+              const candidates = defaultModelCredentialCandidates({
                 provider: input.provider,
                 modelId: input.modelId,
                 preferences,
                 credentials,
               });
-              const credential =
-                choice?.source === "preference" ? choice.preference.credential : choice?.credential;
-              if (!credential) {
+              if (candidates.length === 0) {
                 throw new ORPCError("NOT_FOUND", {
                   message: `No model credential is connected for ${input.provider}.`,
                 });
               }
-              const authError = await validateStoredModelAuth(
-                tx,
-                deps.secrets,
-                context.actor.userId,
-                credential.secretId,
-                input.provider,
-                input.modelId,
-              );
-              if (authError) throw new ORPCError("BAD_REQUEST", { message: authError });
-              await selectSpaceModelPreference(tx, context.actor, credential.id, input.modelId);
+              let authFailure: string | undefined;
+              for (const candidate of candidates) {
+                const authError = await validateStoredModelAuth(
+                  tx,
+                  deps.secrets,
+                  context.actor.userId,
+                  candidate.secretId,
+                  input.provider,
+                  input.modelId,
+                );
+                if (authError) {
+                  authFailure ??= authError;
+                  continue;
+                }
+                await selectSpaceModelPreference(tx, context.actor, candidate.id, input.modelId);
+                return;
+              }
+              throw new ORPCError("BAD_REQUEST", {
+                message: authFailure ?? UNAVAILABLE_MODEL_FOR_AUTH_MESSAGE,
+              });
             },
             { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
           ),

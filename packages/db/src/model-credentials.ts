@@ -159,6 +159,80 @@ export function chooseModelCredential<C extends OrderedCredential>(input: {
   return credential ? { source: "credential", credential } : null;
 }
 
+function appendCredential<C extends OrderedCredential>(
+  target: C[],
+  seen: Set<string>,
+  credential: C,
+) {
+  if (seen.has(credential.id)) return;
+  seen.add(credential.id);
+  target.push(credential);
+}
+
+/**
+ * Credentials to try when saving a space default, best first.
+ * The preference that already owns the model is the only candidate.
+ * Otherwise an account that does not replace a different saved model comes first,
+ * and the provider fallback that owns one is last.
+ */
+export function defaultModelCredentialCandidates<C extends OrderedCredential>(input: {
+  provider: string;
+  modelId?: string | null;
+  preferences: Array<OrderedPreference<C>>;
+  credentials: C[];
+}): C[] {
+  const requestedModelId = usableModelId(input.modelId);
+  const preferences = input.preferences
+    .filter((preference) => preference.credential.provider === input.provider)
+    .sort(comparePreferenceOrder);
+  const credentials = input.credentials
+    .filter((credential) => credential.provider === input.provider)
+    .sort(compareCredentialOrder);
+
+  if (requestedModelId) {
+    const seen = new Set<string>();
+    const owners: C[] = [];
+    for (const preference of preferences) {
+      if (usableModelId(preference.modelId) !== requestedModelId) continue;
+      appendCredential(owners, seen, preference.credential);
+    }
+    if (owners.length > 0) return owners;
+  }
+
+  const preferenceByCredentialId = new Map(
+    preferences.map((preference) => [preference.credential.id, preference]),
+  );
+  const replacesSavedModel = (credentialId: string) => {
+    const owned = usableModelId(preferenceByCredentialId.get(credentialId)?.modelId);
+    return owned !== null && owned !== requestedModelId;
+  };
+  const seen = new Set<string>();
+  const unbound: C[] = [];
+  const bound: C[] = [];
+  const add = (credential: C) => {
+    appendCredential(replacesSavedModel(credential.id) ? bound : unbound, seen, credential);
+  };
+  for (const preference of preferences) add(preference.credential);
+  for (const credential of credentials) add(credential);
+
+  const choice = chooseModelCredential({
+    provider: input.provider,
+    modelId: input.modelId,
+    preferences,
+    credentials,
+  });
+  const fallback =
+    choice?.source === "preference" ? choice.preference.credential : choice?.credential;
+  if (!fallback) return unbound;
+  const fallbackIndex = bound.findIndex((credential) => credential.id === fallback.id);
+  const fallbackCredential = fallbackIndex >= 0 ? bound[fallbackIndex] : undefined;
+  if (fallbackCredential && fallbackIndex !== bound.length - 1) {
+    bound.splice(fallbackIndex, 1);
+    bound.push(fallbackCredential);
+  }
+  return [...unbound, ...bound];
+}
+
 function credentialFromChoice<
   C extends OrderedCredential & {
     userId: string;
