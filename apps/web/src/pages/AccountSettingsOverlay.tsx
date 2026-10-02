@@ -219,9 +219,11 @@ export function UsageSettingsPanel({
 export function ComputerSettingsPanel({
   sandboxProvider,
   onSandboxProviderChange,
+  onRecoveryDismissed,
 }: {
   sandboxProvider?: string | null;
   onSandboxProviderChange?: (sandboxProvider: string) => void;
+  onRecoveryDismissed?: () => void;
 }) {
   return (
     <div
@@ -235,6 +237,7 @@ export function ComputerSettingsPanel({
         className="mt-3 text-[13px] leading-relaxed text-muted-foreground"
         sandboxProvider={sandboxProvider}
         onRecovered={onSandboxProviderChange}
+        onRecoveryDismissed={onRecoveryDismissed}
       />
     </div>
   );

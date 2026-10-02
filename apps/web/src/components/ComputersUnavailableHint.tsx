@@ -20,6 +20,8 @@ type ComputersUnavailableHintProps = {
   onOpenComputerSettings?: () => void;
   /** Called when a check finds computers available again. */
   onRecovered?: (sandboxProvider: string) => void;
+  /** Called when the confirmation should leave the screen. */
+  onRecoveryDismissed?: () => void;
   /** When false, hides Check again (e.g. inline preview without actions). */
   showRetry?: boolean;
 };
@@ -29,6 +31,7 @@ export function ComputersUnavailableHint({
   sandboxProvider: initialProvider,
   onOpenComputerSettings,
   onRecovered,
+  onRecoveryDismissed,
   showRetry = true,
 }: ComputersUnavailableHintProps) {
   const { t } = useLingui();
@@ -38,7 +41,8 @@ export function ComputersUnavailableHint({
   const [copied, setCopied] = useState(false);
   const onRecoveredRef = useRef(onRecovered);
   onRecoveredRef.current = onRecovered;
-  const recoveredProviderRef = useRef<string | null>(null);
+  const onRecoveryDismissedRef = useRef(onRecoveryDismissed);
+  onRecoveryDismissedRef.current = onRecoveryDismissed;
 
   useEffect(() => {
     setProvider(initialProvider);
@@ -47,8 +51,7 @@ export function ComputersUnavailableHint({
   useEffect(() => {
     if (phase !== "recovered") return;
     const timer = window.setTimeout(() => {
-      const recovered = recoveredProviderRef.current;
-      if (recovered) onRecoveredRef.current?.(recovered);
+      onRecoveryDismissedRef.current?.();
       setPhase("idle");
     }, 4000);
     return () => window.clearTimeout(timer);
@@ -68,7 +71,7 @@ export function ComputersUnavailableHint({
         setPhase("unavailable");
         return;
       }
-      recoveredProviderRef.current = me.sandboxProvider;
+      onRecoveredRef.current?.(me.sandboxProvider);
       setPhase("recovered");
     } catch (error) {
       setPhase("failure");

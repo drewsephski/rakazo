@@ -535,6 +535,12 @@ export function ShellPage() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [initialBotsLoaded, setInitialBotsLoaded] = useState(false);
   const [bootstrapMe, setBootstrapMe] = useState<Me | null>();
+  const [keepComputerRecovery, setKeepComputerRecovery] = useState(false);
+  const showComputerRecoveryHint =
+    computersAreUnavailable(bootstrapMe?.sandboxProvider) || keepComputerRecovery;
+  useEffect(() => {
+    if (panel !== "computer") setKeepComputerRecovery(false);
+  }, [panel]);
   const [routineDraft, setRoutineDraft] = useState<RoutineDraftState>(emptyRoutineDraft());
   const [routineWebhookSecret, setRoutineWebhookSecret] = useState<string | null>(null);
   const [editingRoutine, setEditingRoutine] = useState<Routine | null>(null);
@@ -3486,12 +3492,16 @@ export function ShellPage() {
                   ) : (
                     <div className="grid h-full place-items-center px-6 text-center text-sm text-muted-foreground/80">
                       {computerScreenError ??
-                        (computersAreUnavailable(bootstrapMe?.sandboxProvider) ? (
+                        (showComputerRecoveryHint ? (
                           <ComputersUnavailableHint
                             sandboxProvider={bootstrapMe?.sandboxProvider}
-                            onRecovered={(sandboxProvider) =>
-                              setBootstrapMe((prev) => (prev ? { ...prev, sandboxProvider } : prev))
-                            }
+                            onRecovered={(sandboxProvider) => {
+                              setBootstrapMe((prev) =>
+                                prev ? { ...prev, sandboxProvider } : prev,
+                              );
+                              setKeepComputerRecovery(true);
+                            }}
+                            onRecoveryDismissed={() => setKeepComputerRecovery(false)}
                             onOpenComputerSettings={
                               bootstrapMe?.isDeploymentOwner === true
                                 ? () => openSettings("computer")
@@ -3507,8 +3517,7 @@ export function ShellPage() {
                         ))}
                     </div>
                   )}
-                  {!computerScreenError &&
-                  !computersAreUnavailable(bootstrapMe?.sandboxProvider) ? (
+                  {!computerScreenError && !showComputerRecoveryHint ? (
                     <button
                       type="button"
                       data-testid="computer-preview-open"

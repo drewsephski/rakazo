@@ -68,7 +68,9 @@ export function SettingsOverlay({
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [memoryBusy, setMemoryBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
-  const showComputer = isDeploymentOwner && computersAreUnavailable(sandboxProvider);
+  const [keepComputerRecovery, setKeepComputerRecovery] = useState(false);
+  const showComputer =
+    keepComputerRecovery || (isDeploymentOwner && computersAreUnavailable(sandboxProvider));
   const panelBusy = memoryBusy || voiceBusy;
 
   useEffect(() => {
@@ -78,6 +80,10 @@ export function SettingsOverlay({
   useEffect(() => {
     if (!showComputer && section === "computer") setSection("general");
   }, [showComputer, section]);
+
+  useEffect(() => {
+    if (section !== "computer") setKeepComputerRecovery(false);
+  }, [section]);
 
   useEffect(() => {
     if (section === "usage") {
@@ -219,7 +225,11 @@ export function SettingsOverlay({
               {section === "computer" && showComputer ? (
                 <ComputerSettingsPanel
                   sandboxProvider={sandboxProvider}
-                  onSandboxProviderChange={onSandboxProviderChange}
+                  onSandboxProviderChange={(next) => {
+                    onSandboxProviderChange?.(next);
+                    setKeepComputerRecovery(true);
+                  }}
+                  onRecoveryDismissed={() => setKeepComputerRecovery(false)}
                 />
               ) : null}
               {section === "updates" ? (
