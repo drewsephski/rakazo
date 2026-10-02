@@ -3,7 +3,8 @@ import { t } from "@lingui/core/macro";
 import { Trans, useLingui } from "@lingui/react/macro";
 import type { RunActivityRow, RunStatus } from "@rakazo/contracts";
 import { Button, Input, Label } from "@rakazo/ui-web";
-import { type KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   type ActivityListFilters,
   activityFiltersActive,
@@ -143,9 +144,18 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
       />
 
       {error ? (
-        <p role="alert" className="px-2.5 pb-2 text-[12.5px] text-destructive">
-          {error}
-        </p>
+        <div className="px-2.5 pb-2" role="alert">
+          <p className="text-[12.5px] text-destructive">{error}</p>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="mt-2 rounded-full"
+            onClick={() => reloadRef.current?.()}
+          >
+            <Trans>Try again</Trans>
+          </Button>
+        </div>
       ) : null}
 
       {filtersOn && !hasVisibleRuns ? (
