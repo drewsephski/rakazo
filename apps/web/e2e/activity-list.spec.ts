@@ -89,11 +89,35 @@ test("sidebar Now and Recent surface active and terminal runs", async ({ page },
   await expect(aside.getByText("Now", { exact: true })).toHaveCount(0);
   await captureActivitySidebar(page, testInfo, "59-activity-recent");
 
-  await page.getByPlaceholder("Search").fill("Chief");
+  const sidebarSearch = page
+    .getByTestId("sidebar-search")
+    .getByPlaceholder("Search", { exact: true });
+  await sidebarSearch.fill("Chief");
   await expect(aside.getByText("Recent", { exact: true })).toHaveCount(0);
   await expect(activityRow(page, "Chief")).toHaveCount(0);
 
-  await page.getByPlaceholder("Search").fill("");
+  await sidebarSearch.fill("");
   await expect(aside.getByText("Recent", { exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(activityRow(page, "Chief")).toBeVisible();
+
+  const activitySearch = page.getByTestId("activity-search");
+  await activitySearch.fill("Chief");
+  await expect(activityRow(page, "Chief")).toBeVisible();
+  await expect(aside.getByText("Recent", { exact: true })).toBeVisible();
+  await captureActivitySidebar(page, testInfo, "60-activity-search-match");
+
+  await activitySearch.fill("no-such-run");
+  await expect(aside.getByText("No runs match these filters.")).toBeVisible();
+  await expect(activityRow(page, "Chief")).toHaveCount(0);
+  await expect(aside.getByText("Recent", { exact: true })).toHaveCount(0);
+  await captureActivitySidebar(page, testInfo, "61-activity-filters-empty");
+
+  await page.getByTestId("activity-reset-filters").click();
+  await expect(activityRow(page, "Chief")).toBeVisible();
+
+  await page.getByTestId("activity-status-filter").selectOption("failed");
+  await expect(aside.getByText("No runs match these filters.")).toBeVisible();
+  await expect(activityRow(page, "Chief")).toHaveCount(0);
+  await page.getByTestId("activity-reset-filters").click();
   await expect(activityRow(page, "Chief")).toBeVisible();
 });
