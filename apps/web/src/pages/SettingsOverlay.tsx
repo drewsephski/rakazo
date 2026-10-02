@@ -2,7 +2,8 @@ import { useLingui } from "@lingui/react/macro";
 import type { AvatarStyle, SpaceMemoryConfig } from "@rakazo/contracts";
 import { Button, Dialog, DialogClose, DialogContent, DialogTitle } from "@rakazo/ui-web";
 import { Brain, CloudDownload, Cpu, Gauge, Monitor, Settings, Volume2, XIcon } from "lucide-react";
-import { type ComponentType, useEffect, useRef, useState } from "react";
+import type { ComponentType } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { computersAreUnavailable } from "../components/ComputersUnavailableHint";
 import {
   ComputerSettingsPanel,
@@ -69,9 +70,23 @@ export function SettingsOverlay({
   const [memoryBusy, setMemoryBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [keepComputerRecovery, setKeepComputerRecovery] = useState(false);
+  const recoveryHoldTimer = useRef<number | undefined>(undefined);
   const showComputer =
     keepComputerRecovery || (isDeploymentOwner && computersAreUnavailable(sandboxProvider));
   const panelBusy = memoryBusy || voiceBusy;
+  const releaseComputerRecovery = useCallback(() => {
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = undefined;
+    setKeepComputerRecovery(false);
+  }, []);
+  const holdComputerRecovery = useCallback(() => {
+    setKeepComputerRecovery(true);
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = window.setTimeout(() => {
+      recoveryHoldTimer.current = undefined;
+      setKeepComputerRecovery(false);
+    }, 4000);
+  }, []);
 
   useEffect(() => {
     setSection(initialSection);
@@ -82,8 +97,9 @@ export function SettingsOverlay({
   }, [showComputer, section]);
 
   useEffect(() => {
-    if (section !== "computer") setKeepComputerRecovery(false);
-  }, [section]);
+    if (section !== "computer") releaseComputerRecovery();
+  }, [section, releaseComputerRecovery]);
+  useEffect(() => () => window.clearTimeout(recoveryHoldTimer.current), []);
 
   useEffect(() => {
     if (section === "usage") {
@@ -227,9 +243,9 @@ export function SettingsOverlay({
                   sandboxProvider={sandboxProvider}
                   onSandboxProviderChange={(next) => {
                     onSandboxProviderChange?.(next);
-                    setKeepComputerRecovery(true);
+                    holdComputerRecovery();
                   }}
-                  onRecoveryDismissed={() => setKeepComputerRecovery(false)}
+                  onRecoveryDismissed={releaseComputerRecovery}
                 />
               ) : null}
               {section === "updates" ? (

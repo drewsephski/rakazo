@@ -536,11 +536,26 @@ export function ShellPage() {
   const [initialBotsLoaded, setInitialBotsLoaded] = useState(false);
   const [bootstrapMe, setBootstrapMe] = useState<Me | null>();
   const [keepComputerRecovery, setKeepComputerRecovery] = useState(false);
+  const recoveryHoldTimer = useRef<number | undefined>(undefined);
   const showComputerRecoveryHint =
     computersAreUnavailable(bootstrapMe?.sandboxProvider) || keepComputerRecovery;
+  const releaseComputerRecovery = useCallback(() => {
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = undefined;
+    setKeepComputerRecovery(false);
+  }, []);
+  const holdComputerRecovery = useCallback(() => {
+    setKeepComputerRecovery(true);
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = window.setTimeout(() => {
+      recoveryHoldTimer.current = undefined;
+      setKeepComputerRecovery(false);
+    }, 4000);
+  }, []);
   useEffect(() => {
-    if (panel !== "computer") setKeepComputerRecovery(false);
-  }, [panel]);
+    if (panel !== "computer") releaseComputerRecovery();
+  }, [panel, releaseComputerRecovery]);
+  useEffect(() => () => window.clearTimeout(recoveryHoldTimer.current), []);
   const [routineDraft, setRoutineDraft] = useState<RoutineDraftState>(emptyRoutineDraft());
   const [routineWebhookSecret, setRoutineWebhookSecret] = useState<string | null>(null);
   const [editingRoutine, setEditingRoutine] = useState<Routine | null>(null);
@@ -2559,6 +2574,18 @@ export function ShellPage() {
         </Button>
       </div>
     ) : null;
+  const computerPreviewScreen =
+    !computerOpen &&
+    computer?.kind !== "desktop" &&
+    computer?.state === "running" &&
+    Boolean(embeddedScreenUrl) &&
+    !computerScreenError;
+  const showingRecoveryHint =
+    !computerOpen &&
+    computer?.kind !== "desktop" &&
+    !computerPreviewScreen &&
+    !computerScreenError &&
+    showComputerRecoveryHint;
 
   const userName = session.data?.user.name ?? t`You`;
   const initials = userName
@@ -3472,7 +3499,9 @@ export function ShellPage() {
               <div>
                 <div
                   data-testid="computer-preview"
-                  className="group relative aspect-[16/10] overflow-hidden rounded-[14px] bg-background"
+                  className={`group relative rounded-[14px] bg-background ${
+                    showingRecoveryHint ? "" : "aspect-[16/10] overflow-hidden"
+                  }`}
                 >
                   {computerOpen ? (
                     <div className="grid h-full place-items-center text-sm text-muted-foreground/80">
@@ -3499,9 +3528,9 @@ export function ShellPage() {
                               setBootstrapMe((prev) =>
                                 prev ? { ...prev, sandboxProvider } : prev,
                               );
-                              setKeepComputerRecovery(true);
+                              holdComputerRecovery();
                             }}
-                            onRecoveryDismissed={() => setKeepComputerRecovery(false)}
+                            onRecoveryDismissed={releaseComputerRecovery}
                             onOpenComputerSettings={
                               bootstrapMe?.isDeploymentOwner === true
                                 ? () => openSettings("computer")
@@ -3517,7 +3546,7 @@ export function ShellPage() {
                         ))}
                     </div>
                   )}
-                  {!computerScreenError && !showComputerRecoveryHint ? (
+                  {!computerScreenError && !showingRecoveryHint ? (
                     <button
                       type="button"
                       data-testid="computer-preview-open"
