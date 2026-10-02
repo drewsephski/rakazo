@@ -3,7 +3,7 @@ import { t } from "@lingui/core/macro";
 import { Trans, useLingui } from "@lingui/react/macro";
 import type { RunActivityRow, RunStatus } from "@rakazo/contracts";
 import { Button, Input, Label } from "@rakazo/ui-web";
-import { type KeyboardEvent, useEffect, useId, useMemo, useState } from "react";
+import { type KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   type ActivityListFilters,
   activityFiltersActive,
@@ -37,34 +37,50 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
   const [error, setError] = useState<string | null>(null);
   const [filters, setFilters] = useState<ActivityListFilters>(() => emptyActivityFilters());
 
+  const reloadRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     let timer: number | undefined;
+    let generation = 0;
 
-    const tick = async () => {
-      try {
-        const [active, recent] = await Promise.all([
-          rpc.runs.list({ filter: "active" }),
-          rpc.runs.list({ filter: "recent" }),
-        ]);
-        if (cancelled) return;
-        setActiveRuns(active.runs);
-        setRecentRuns(recent.runs);
-        setError(null);
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : t`Could not load activity`);
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-          timer = window.setTimeout(() => void tick(), 15_000);
-        }
+    const load = () => {
+      const requestId = ++generation;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
       }
+      void (async () => {
+        try {
+          const [active, recent] = await Promise.all([
+            rpc.runs.list({ filter: "active" }),
+            rpc.runs.list({ filter: "recent" }),
+          ]);
+          if (cancelled || requestId !== generation) return;
+          setActiveRuns(active.runs);
+          setRecentRuns(recent.runs);
+          setError(null);
+        } catch (err) {
+          if (cancelled || requestId !== generation) return;
+          setError(err instanceof Error ? err.message : t`Could not load activity`);
+        } finally {
+          if (!cancelled && requestId === generation) {
+            setLoading(false);
+            timer = window.setTimeout(load, 15_000);
+          }
+        }
+      })();
     };
 
-    void tick();
+    reloadRef.current = () => {
+      setLoading(true);
+      setError(null);
+      load();
+    };
+    load();
     return () => {
       cancelled = true;
+      reloadRef.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [t]);
@@ -88,7 +104,7 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
     }
   }
 
-  if (loading && !hasAnyRuns) {
+  if (loading && !hasAnyRuns && !filtersOn) {
     return (
       <div className="px-2.5 py-2 text-[13px] text-muted-foreground/80" role="status">
         <Trans>Loading activity…</Trans>
@@ -96,7 +112,8 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
     );
   }
 
-  if (error && !hasAnyRuns) {
+  if (!hasAnyRuns && !filtersOn) {
+    if (!error) return null;
     return (
       <div className="px-2.5 py-2" role="alert">
         <p className="text-[13px] text-destructive">{error}</p>
@@ -105,31 +122,13 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
           variant="secondary"
           size="sm"
           className="mt-2 rounded-full"
-          onClick={() => {
-            setLoading(true);
-            setError(null);
-            void Promise.all([
-              rpc.runs.list({ filter: "active" }),
-              rpc.runs.list({ filter: "recent" }),
-            ])
-              .then(([active, recent]) => {
-                setActiveRuns(active.runs);
-                setRecentRuns(recent.runs);
-                setError(null);
-              })
-              .catch((err) => {
-                setError(err instanceof Error ? err.message : t`Could not load activity`);
-              })
-              .finally(() => setLoading(false));
-          }}
+          onClick={() => reloadRef.current?.()}
         >
           <Trans>Try again</Trans>
         </Button>
       </div>
     );
   }
-
-  if (!hasAnyRuns) return null;
 
   return (
     <div className="mb-2 border-b border-border pb-2" data-testid="activity-list">

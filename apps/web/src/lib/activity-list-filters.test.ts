@@ -26,6 +26,16 @@ function row(overrides: Partial<RunActivityRow> = {}): RunActivityRow {
 }
 
 describe("filterActivityRuns", () => {
+  it("matches the displayed group title and either name", () => {
+    const run = row({ botName: "Chief", groupName: "Ops", promptSnippet: "standby" });
+    const filters = (query: string) => ({ ...emptyActivityFilters(), query });
+    expect(runMatchesActivityFilters(run, filters("Chief · Ops"))).toBe(true);
+    expect(runMatchesActivityFilters(run, filters("Chief Ops"))).toBe(true);
+    expect(runMatchesActivityFilters(run, filters("Chief"))).toBe(true);
+    expect(runMatchesActivityFilters(run, filters("Ops"))).toBe(true);
+    expect(runMatchesActivityFilters(run, filters("missing"))).toBe(false);
+  });
+
   it("matches bot name and prompt in search", () => {
     const runs = [row(), row({ botName: "Scout", promptSnippet: "other" })];
     const filtered = filterActivityRuns(runs, {

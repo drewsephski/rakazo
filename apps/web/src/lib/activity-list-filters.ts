@@ -29,8 +29,16 @@ export function activityFiltersActive(filters: ActivityListFilters): boolean {
 }
 
 export function activitySearchHaystack(run: RunActivityRow): string {
-  const title = run.groupName ? `${run.botName} ${run.groupName}` : run.botName;
-  return `${title} ${run.promptSnippet}`.toLowerCase();
+  const parts = [run.botName];
+  if (run.groupName) {
+    parts.push(
+      run.groupName,
+      `${run.botName} ${run.groupName}`,
+      `${run.botName} · ${run.groupName}`,
+    );
+  }
+  parts.push(run.promptSnippet);
+  return parts.join(" ").toLowerCase();
 }
 
 function parseDayStart(isoDate: string): number | null {
