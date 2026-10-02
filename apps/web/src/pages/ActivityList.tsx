@@ -158,7 +158,11 @@ export function ActivityList({ onOpenRun }: ActivityListProps) {
         </div>
       ) : null}
 
-      {filtersOn && !hasVisibleRuns ? (
+      {loading && !hasAnyRuns ? (
+        <p className="px-2.5 py-2 text-[13px] text-muted-foreground/80" role="status">
+          <Trans>Loading activity…</Trans>
+        </p>
+      ) : !error && filtersOn && !hasVisibleRuns ? (
         <p className="px-2.5 py-2 text-[13px] text-muted-foreground/80" role="status">
           <Trans>No runs match these filters.</Trans>
         </p>
