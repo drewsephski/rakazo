@@ -30,11 +30,16 @@ describe("classifySandboxProvider", () => {
 });
 
 describe("sandboxEnvGuidanceText", () => {
-  it("uses placeholder tokens only", () => {
+  it("uses placeholder tokens and activates only one provider", () => {
     const text = sandboxEnvGuidanceText();
     expect(text).toContain("SANDBOX_SUPERVISOR_TOKEN=<generate-a-secret>");
     expect(text).not.toMatch(/sk-[a-zA-Z0-9]{10,}/);
-    expect(sandboxEnvGuidanceLines().length).toBeGreaterThan(5);
+    expect(sandboxEnvGuidanceLines().filter((line) => /^SANDBOX_PROVIDER=/.test(line))).toEqual([
+      "SANDBOX_PROVIDER=docker",
+    ]);
+    expect(text).toContain("# SANDBOX_PROVIDER=e2b");
+    expect(text).toContain("# SANDBOX_PROVIDER=daytona");
+    expect(text).toContain("# SANDBOX_PROVIDER=box");
   });
 });
 

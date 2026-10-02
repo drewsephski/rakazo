@@ -2615,11 +2615,7 @@ export function ShellPage() {
         }}
       />
       {bootstrapMe !== undefined ? (
-        <HostComputerPrompt
-          initialMe={bootstrapMe ?? undefined}
-          onMeUpdated={setBootstrapMe}
-          onOpenComputerSettings={() => openSettings("computer")}
-        />
+        <HostComputerPrompt initialMe={bootstrapMe ?? undefined} onMeUpdated={setBootstrapMe} />
       ) : null}
       {mobileSidebarOpen ? (
         <button
@@ -3496,7 +3492,11 @@ export function ShellPage() {
                             onRecovered={(sandboxProvider) =>
                               setBootstrapMe((prev) => (prev ? { ...prev, sandboxProvider } : prev))
                             }
-                            onOpenComputerSettings={() => openSettings("computer")}
+                            onOpenComputerSettings={
+                              bootstrapMe?.isDeploymentOwner === true
+                                ? () => openSettings("computer")
+                                : undefined
+                            }
                           />
                         ) : (
                           computerPlaceholder(
@@ -3507,7 +3507,8 @@ export function ShellPage() {
                         ))}
                     </div>
                   )}
-                  {!computerScreenError ? (
+                  {!computerScreenError &&
+                  !computersAreUnavailable(bootstrapMe?.sandboxProvider) ? (
                     <button
                       type="button"
                       data-testid="computer-preview-open"

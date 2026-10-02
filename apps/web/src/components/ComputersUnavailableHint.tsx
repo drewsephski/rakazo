@@ -1,11 +1,11 @@
 import { Trans, useLingui } from "@lingui/react/macro";
 import { Button } from "@rakazo/ui-web";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { SandboxAvailabilityPhase } from "../lib/computer-sandbox";
 import {
   classifySandboxProvider,
   computersAreUnavailable,
   refreshSandboxFromServer,
-  type SandboxAvailabilityPhase,
   sandboxCheckFailureMessage,
   sandboxEnvGuidanceText,
 } from "../lib/computer-sandbox";
@@ -36,6 +36,9 @@ export function ComputersUnavailableHint({
   const [phase, setPhase] = useState<SandboxAvailabilityPhase>("idle");
   const [failureMessage, setFailureMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const onRecoveredRef = useRef(onRecovered);
+  onRecoveredRef.current = onRecovered;
+  const recoveredProviderRef = useRef<string | null>(null);
 
   useEffect(() => {
     setProvider(initialProvider);
@@ -43,8 +46,12 @@ export function ComputersUnavailableHint({
 
   useEffect(() => {
     if (phase !== "recovered") return;
-    const timer = setTimeout(() => setPhase("idle"), 4000);
-    return () => clearTimeout(timer);
+    const timer = window.setTimeout(() => {
+      const recovered = recoveredProviderRef.current;
+      if (recovered) onRecoveredRef.current?.(recovered);
+      setPhase("idle");
+    }, 4000);
+    return () => window.clearTimeout(timer);
   }, [phase]);
 
   const unavailable = computersAreUnavailable(provider);
@@ -61,8 +68,8 @@ export function ComputersUnavailableHint({
         setPhase("unavailable");
         return;
       }
+      recoveredProviderRef.current = me.sandboxProvider;
       setPhase("recovered");
-      onRecovered?.(me.sandboxProvider);
     } catch (error) {
       setPhase("failure");
       setFailureMessage(sandboxCheckFailureMessage(error));

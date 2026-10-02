@@ -16,11 +16,9 @@ import { rpc } from "../lib/rpc";
 export function HostComputerPrompt({
   initialMe,
   onMeUpdated,
-  onOpenComputerSettings,
 }: {
   initialMe?: Me;
   onMeUpdated?: (me: Me) => void;
-  onOpenComputerSettings?: () => void;
 }) {
   const { t } = useLingui();
   const desktop = desktopBridge();
@@ -68,14 +66,19 @@ export function HostComputerPrompt({
     setError(null);
     try {
       await rpc.deployment.update({ computerHost });
-      const me = await rpc.me();
-      onMeUpdated?.(me);
-      setOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : t`Could not save that choice`);
-    } finally {
       setPending(false);
+      return;
     }
+    try {
+      const me = await rpc.me();
+      onMeUpdated?.(me);
+    } catch {
+      // The choice is already saved. A failed refresh must not look like a failed save.
+    }
+    setOpen(false);
+    setPending(false);
   }
 
   const busy = pending || checking;
@@ -133,18 +136,6 @@ export function HostComputerPrompt({
             >
               {checking ? <Trans>Checking…</Trans> : <Trans>Check again</Trans>}
             </Button>
-            {onOpenComputerSettings ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="rounded-full"
-                disabled={busy}
-                onClick={onOpenComputerSettings}
-              >
-                <Trans>Computer setup</Trans>
-              </Button>
-            ) : null}
           </div>
         ) : null}
       </DialogContent>
