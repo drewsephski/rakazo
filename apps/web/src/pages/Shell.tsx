@@ -535,6 +535,27 @@ export function ShellPage() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [initialBotsLoaded, setInitialBotsLoaded] = useState(false);
   const [bootstrapMe, setBootstrapMe] = useState<Me | null>();
+  const [keepComputerRecovery, setKeepComputerRecovery] = useState(false);
+  const recoveryHoldTimer = useRef<number | undefined>(undefined);
+  const showComputerRecoveryHint =
+    computersAreUnavailable(bootstrapMe?.sandboxProvider) || keepComputerRecovery;
+  const releaseComputerRecovery = useCallback(() => {
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = undefined;
+    setKeepComputerRecovery(false);
+  }, []);
+  const holdComputerRecovery = useCallback(() => {
+    setKeepComputerRecovery(true);
+    window.clearTimeout(recoveryHoldTimer.current);
+    recoveryHoldTimer.current = window.setTimeout(() => {
+      recoveryHoldTimer.current = undefined;
+      setKeepComputerRecovery(false);
+    }, 4000);
+  }, []);
+  useEffect(() => {
+    if (panel !== "computer") releaseComputerRecovery();
+  }, [panel, releaseComputerRecovery]);
+  useEffect(() => () => window.clearTimeout(recoveryHoldTimer.current), []);
   const [routineDraft, setRoutineDraft] = useState<RoutineDraftState>(emptyRoutineDraft());
   const [routineWebhookSecret, setRoutineWebhookSecret] = useState<string | null>(null);
   const [editingRoutine, setEditingRoutine] = useState<Routine | null>(null);
@@ -2553,6 +2574,18 @@ export function ShellPage() {
         </Button>
       </div>
     ) : null;
+  const computerPreviewScreen =
+    !computerOpen &&
+    computer?.kind !== "desktop" &&
+    computer?.state === "running" &&
+    Boolean(embeddedScreenUrl) &&
+    !computerScreenError;
+  const showingRecoveryHint =
+    !computerOpen &&
+    computer?.kind !== "desktop" &&
+    !computerPreviewScreen &&
+    !computerScreenError &&
+    showComputerRecoveryHint;
 
   const userName = session.data?.user.name ?? t`You`;
   const initials = userName
@@ -2615,7 +2648,7 @@ export function ShellPage() {
         }}
       />
       {bootstrapMe !== undefined ? (
-        <HostComputerPrompt initialMe={bootstrapMe ?? undefined} />
+        <HostComputerPrompt initialMe={bootstrapMe ?? undefined} onMeUpdated={setBootstrapMe} />
       ) : null}
       {mobileSidebarOpen ? (
         <button
@@ -3466,7 +3499,9 @@ export function ShellPage() {
               <div>
                 <div
                   data-testid="computer-preview"
-                  className="group relative aspect-[16/10] overflow-hidden rounded-[14px] bg-background"
+                  className={`group relative rounded-[14px] bg-background ${
+                    showingRecoveryHint ? "" : "aspect-[16/10] overflow-hidden"
+                  }`}
                 >
                   {computerOpen ? (
                     <div className="grid h-full place-items-center text-sm text-muted-foreground/80">
@@ -3486,8 +3521,22 @@ export function ShellPage() {
                   ) : (
                     <div className="grid h-full place-items-center px-6 text-center text-sm text-muted-foreground/80">
                       {computerScreenError ??
-                        (computersAreUnavailable(bootstrapMe?.sandboxProvider) ? (
-                          <ComputersUnavailableHint />
+                        (showComputerRecoveryHint ? (
+                          <ComputersUnavailableHint
+                            sandboxProvider={bootstrapMe?.sandboxProvider}
+                            onRecovered={(sandboxProvider) => {
+                              setBootstrapMe((prev) =>
+                                prev ? { ...prev, sandboxProvider } : prev,
+                              );
+                              holdComputerRecovery();
+                            }}
+                            onRecoveryDismissed={releaseComputerRecovery}
+                            onOpenComputerSettings={
+                              bootstrapMe?.isDeploymentOwner === true
+                                ? () => openSettings("computer")
+                                : undefined
+                            }
+                          />
                         ) : (
                           computerPlaceholder(
                             computer?.state,
@@ -3497,7 +3546,7 @@ export function ShellPage() {
                         ))}
                     </div>
                   )}
-                  {!computerScreenError ? (
+                  {!computerScreenError && !showingRecoveryHint ? (
                     <button
                       type="button"
                       data-testid="computer-preview-open"
@@ -4139,6 +4188,9 @@ export function ShellPage() {
             avatarStyle={bootstrapMe?.avatarStyle ?? "robot"}
             isDeploymentOwner={bootstrapMe?.isDeploymentOwner === true}
             sandboxProvider={bootstrapMe?.sandboxProvider}
+            onSandboxProviderChange={(sandboxProvider) =>
+              setBootstrapMe((prev) => (prev ? { ...prev, sandboxProvider } : prev))
+            }
             messagingEnabled={messagingSurfaceEnabled}
             onOpenMessaging={() => {
               setSettingsOpen(false);
